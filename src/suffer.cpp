@@ -424,7 +424,7 @@ void suffer::while_grabbed( Character &you )
     bool pressure_absorbed = true;
     const auto absorb_bodypart_pressure = [&]( const bodypart_id & bp, float pressure_amount ) {
         damage_instance pressure( damage_bash, pressure_amount );
-        you.absorb_hit( weakpoint_attack(), bp, pressure );
+        you.absorb_hit( weakpoint_attack(), bp, pressure, weakpoint(), false );
         if( pressure.total_damage() > 0.0f ) {
             pressure_absorbed = false;
         }
@@ -432,7 +432,7 @@ void suffer::while_grabbed( Character &you )
     const auto absorb_sub_bodypart_pressure = [&]( const sub_bodypart_id & sbp, float pressure_amount,
     bool allow_torso_neck_fallback = false ) {
         damage_instance pressure( damage_bash, pressure_amount );
-        you.absorb_hit( sbp, pressure, allow_torso_neck_fallback );
+        you.absorb_hit( sbp, pressure, allow_torso_neck_fallback, false );
         if( pressure.total_damage() > 0.0f ) {
             pressure_absorbed = false;
         }
@@ -2141,6 +2141,15 @@ void Character::apply_wetness_morale( units::temperature temperature )
             morale_effect = -1;
         }
     }
+
+    // Sensitivity scales how much being wet affects morale, ±50% across 0..500.
+    const double sens_mult = clamp( 1.0 + 0.5 * std::log( std::clamp( get_sensitive(), 1,
+                                           500 ) / 100.0 ) / std::log( 5.0 ), 0.5, 1.5 );
+    const int scaled_effect = round( morale_effect * sens_mult );
+    if( scaled_effect != 0 || morale_effect == 0 ) {
+        morale_effect = scaled_effect;
+    }
+
     // 61_seconds because decay is applied in 1_minutes increments
     add_morale( morale_wet, morale_effect, total_morale, 61_seconds, 61_seconds, true );
 }
