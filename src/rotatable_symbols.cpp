@@ -1,3 +1,4 @@
+#include "mod_id_compat.h"
 #include "rotatable_symbols.h"
 
 #include <algorithm>
@@ -8,7 +9,7 @@
 #include <vector>
 
 #include "catacharset.h"
-#include "catalua_platform_content.h"
+#include "lua_platform_content.h"
 #include "flexbuffer_json.h"
 #include "generic_factory.h"
 #include "string_formatter.h"
@@ -97,7 +98,7 @@ namespace rotatable_symbols
 void load( const JsonObject &jo, const std::string &src )
 {
     const std::string tuple_key = "tuple";
-    const bool strict = src == "dda";
+    const bool strict = is_core_data_source( src );
 
     std::vector<std::string> tuple_temp;
 

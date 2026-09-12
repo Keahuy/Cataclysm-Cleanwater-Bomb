@@ -194,12 +194,14 @@ void cataimgui::client::set_alloced_pair_count( short count )
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wold-style-cast"
-void cataimgui::client::process_input( void *input, int display_buffer_w, int display_buffer_h )
+void cataimgui::client::process_input( void *input, int display_buffer_w, int display_buffer_h,
+                                       int scaling_factor )
 {
     // TUI input is in cell coordinates from ncurses; no display-buffer
     // pixel scaling.
     ( void )display_buffer_w;
     ( void )display_buffer_h;
+    ( void )scaling_factor;
     if( !any_window_shown() ) {
         return;
     }
@@ -685,10 +687,14 @@ void cataimgui::request_clear()
     clear_screen = true;
 }
 
-void cataimgui::client::process_input( void *input, int display_buffer_w, int display_buffer_h )
+void cataimgui::client::process_input( void *input, int display_buffer_w, int display_buffer_h,
+                                       int scaling_factor )
 {
     if( any_window_shown() ) {
         const SDL_Event *evt = static_cast<const SDL_Event *>( input );
+        if( !evt ) {
+            return;
+        }
         bool no_mouse = ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_NoMouse;
         if( no_mouse ) {
             switch( evt->type ) {
@@ -702,16 +708,29 @@ void cataimgui::client::process_input( void *input, int display_buffer_w, int di
         ( void )display_buffer_w;
         ( void )display_buffer_h;
 #if SDL_MAJOR_VERSION >= 3
-        ImGui_ImplSDL3_ProcessEvent( evt );
+        SDL_Event imgui_ev = *evt;
+        if( scaling_factor > 1 ) {
+            if( imgui_ev.type == CATA_MOUSEMOTION ) {
+                imgui_ev.motion.x /= scaling_factor;
+                imgui_ev.motion.y /= scaling_factor;
+            } else if( imgui_ev.type == CATA_MOUSEBUTTONDOWN || imgui_ev.type == CATA_MOUSEBUTTONUP ) {
+                imgui_ev.button.x /= scaling_factor;
+                imgui_ev.button.y /= scaling_factor;
+            } else if( imgui_ev.type == CATA_MOUSEWHEEL ) {
+                imgui_ev.wheel.mouse_x /= scaling_factor;
+                imgui_ev.wheel.mouse_y /= scaling_factor;
+            }
+        }
+        ImGui_ImplSDL3_ProcessEvent( &imgui_ev );
 #if defined(__ANDROID__)
         // Android keyboards may report editing controls with SDLK_UNKNOWN while
         // preserving the physical scancode.  The stock SDL3 ImGui backend maps
         // most controls from keycode only, so normalize the controls needed by
         // text widgets here.  AddKeyEvent filters duplicates when both paths
         // resolve the same key.
-        if( evt->type == CATA_KEYDOWN || evt->type == CATA_KEYUP ) {
+        if( imgui_ev.type == CATA_KEYDOWN || imgui_ev.type == CATA_KEYUP ) {
             ImGuiKey key = ImGuiKey_None;
-            switch( evt->key.scancode ) {
+            switch( imgui_ev.key.scancode ) {
                 case SDL_SCANCODE_BACKSPACE:
                     key = ImGuiKey_Backspace;
                     break;
@@ -734,11 +753,12 @@ void cataimgui::client::process_input( void *input, int display_buffer_w, int di
                     break;
             }
             if( key != ImGuiKey_None ) {
-                ImGui::GetIO().AddKeyEvent( key, evt->type == CATA_KEYDOWN );
+                ImGui::GetIO().AddKeyEvent( key, imgui_ev.type == CATA_KEYDOWN );
             }
         }
 #endif
 #else
+        ( void )scaling_factor;
         // Coordinates already converted to display_buffer space by
         // convert_event_to_display_buffer_coords in the event pump.
         ImGui_ImplSDL2_ProcessEvent( evt );
@@ -761,6 +781,9 @@ bool cataimgui::client::auto_size_frame_active()
 
 bool cataimgui::client::any_window_shown()
 {
+    if( !ui_adaptor::has_imgui() ) {
+        return false;
+    }
     bool any_window_shown = false;
     for( const ImGuiWindow *window : GImGui->Windows ) {
         if( window->Active && !window->Hidden ) {
@@ -774,7 +797,7 @@ bool cataimgui::client::any_window_shown()
 bool cataimgui::client::want_capture_mouse()
 {
     ImGuiContext *ctx = ImGui::GetCurrentContext();
-    if( !ctx ) {
+    if( !ctx || !ui_adaptor::has_imgui() ) {
         return false;
     }
 
@@ -1174,7 +1197,12 @@ cataimgui::window::~window()
     if( GImGui ) {
         ImGui::ClearWindowSettings( id.c_str() );
         if( !ui_adaptor::has_imgui() ) {
+            // ClearInputKeys deliberately excludes mouse state.  A queued
+            // release can be discarded with the window, leaving ImGui holding
+            // a button and capturing subsequent map clicks indefinitely.
+            ImGui::ClearActiveID();
             ImGui::GetIO().ClearInputKeys();
+            ImGui::GetIO().ClearInputMouse();
             GImGui->InputEventsQueue.resize( 0 );
 #ifdef TILES
             // Removes leftover ImGui artifacts

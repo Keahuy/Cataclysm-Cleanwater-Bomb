@@ -1,5 +1,28 @@
 #include "character.h"
 
+#include <activity_tracker.h>
+#include <body_part_set.h>
+#include <bodypart.h>
+#include <character_id.h>
+#include <compatibility.h>
+#include <craft_command.h>
+#include <creature.h>
+#include <damage.h>
+#include <flat_set.h>
+#include <global_vars.h>
+#include <item.h>
+#include <memory_fast.h>
+#include <pimpl.h>
+#include <player_activity.h>
+#include <pocket_type.h>
+#include <point.h>
+#include <ranged.h>
+#include <sleep.h>
+#include <subbodypart.h>
+#include <type_id.h>
+#include <visitable.h>
+#include <weighted_list.h>
+
 #define MP_ENABLED
 #include <algorithm>
 #include <array>
@@ -18,7 +41,7 @@
 #include "activity_actor.h"
 #include "activity_actor_definitions.h"
 #include "addiction.h"
-#include "clone_ptr.h"
+#include "bonuses.h"
 #include "anatomy.h"
 #include "avatar.h"
 #include "avatar_action.h"
@@ -27,10 +50,10 @@
 #include "calendar.h"
 #include "cata_utility.h"
 #include "catacharset.h"
-#include "catalua_ui.h"
 #include "character_attire.h"
 #include "character_martial_arts.h"
 #include "city.h"
+#include "clone_ptr.h"
 #include "color.h"
 #include "coordinates.h"
 #include "creature_tracker.h"
@@ -62,6 +85,8 @@
 #include "lightmap.h"
 #include "line.h"
 #include "localized_comparator.h"
+#include "lua_platform_hooks.h"
+#include "lua_platform_runtime.h"
 #include "magic.h"
 #include "magic_enchantment.h"
 #include "map.h"
@@ -140,6 +165,7 @@ static const activity_id ACT_WAIT_FOLLOWERS( "ACT_WAIT_FOLLOWERS" );
 static const activity_id ACT_WAIT_NPC( "ACT_WAIT_NPC" );
 static const activity_id ACT_WAIT_STAMINA( "ACT_WAIT_STAMINA" );
 
+static const addiction_id addiction_cannabis( "cannabis" );
 static const addiction_id addiction_opiate( "opiate" );
 static const addiction_id addiction_sleeping_pill( "sleeping pill" );
 
@@ -155,17 +181,6 @@ static const bionic_id bio_uncanny_dodge( "bio_uncanny_dodge" );
 static const bionic_id bio_ups( "bio_ups" );
 static const bionic_id bio_voice( "bio_voice" );
 static const bionic_id fcl_bio_railgun( "fcl_bio_railgun" );
-
-static const mod_id MOD_INFORMATION_catalegacy_future( "catalegacy_future" );
-
-static bool fcl_mod_is_active()
-{
-    return world_generator && world_generator->active_world &&
-           std::find( world_generator->active_world->active_mod_order.begin(),
-                      world_generator->active_world->active_mod_order.end(),
-                      MOD_INFORMATION_catalegacy_future ) !=
-           world_generator->active_world->active_mod_order.end();
-}
 
 static const character_modifier_id character_modifier_aim_speed_dex_mod( "aim_speed_dex_mod" );
 static const character_modifier_id character_modifier_aim_speed_mod( "aim_speed_mod" );
@@ -218,10 +233,11 @@ static const efftype_id effect_harnessed( "harnessed" );
 static const efftype_id effect_in_pit( "in_pit" );
 static const efftype_id effect_incorporeal( "incorporeal" );
 static const efftype_id effect_infected( "infected" );
+static const efftype_id effect_leashed( "leashed" );
+static const efftype_id effect_led_by_leash( "led_by_leash" );
 static const efftype_id effect_masked_scent( "masked_scent" );
 static const efftype_id effect_mech_recon_vision( "mech_recon_vision" );
 static const efftype_id effect_melatonin( "melatonin" );
-static const efftype_id effect_meth( "meth" );
 static const efftype_id effect_monster_saddled( "monster_saddled" );
 static const efftype_id effect_narcosis( "narcosis" );
 static const efftype_id effect_no_sight( "no_sight" );
@@ -237,6 +253,7 @@ static const efftype_id effect_subaquatic_sonar( "subaquatic_sonar" );
 static const efftype_id effect_tapeworm( "tapeworm" );
 static const efftype_id effect_tied( "tied" );
 static const efftype_id effect_transition_contacts( "transition_contacts" );
+static const efftype_id effect_weed_high( "weed_high" );
 static const efftype_id effect_winded( "winded" );
 
 static const fault_id fault_bionic_salvaged( "fault_bionic_salvaged" );
@@ -256,6 +273,7 @@ static const json_character_flag json_flag_BIONIC_TOGGLED( "BIONIC_TOGGLED" );
 static const json_character_flag json_flag_CANNIBAL( "CANNIBAL" );
 static const json_character_flag json_flag_CANNOT_CHANGE_TEMPERATURE( "CANNOT_CHANGE_TEMPERATURE" );
 static const json_character_flag json_flag_CANNOT_MOVE( "CANNOT_MOVE" );
+static const json_character_flag json_flag_CANNOT_SLEEP( "CANNOT_SLEEP" );
 static const json_character_flag json_flag_CLAIRVOYANCE( "CLAIRVOYANCE" );
 static const json_character_flag json_flag_CLAIRVOYANCE_PLUS( "CLAIRVOYANCE_PLUS" );
 static const json_character_flag json_flag_DEAF( "DEAF" );
@@ -324,6 +342,8 @@ static const material_id material_mc_steel_chain( "mc_steel_chain" );
 static const material_id material_qt_steel( "qt_steel" );
 static const material_id material_qt_steel_chain( "qt_steel_chain" );
 static const material_id material_steel( "steel" );
+
+static const mod_id MOD_INFORMATION_catalegacy_future( "catalegacy_future" );
 
 static const move_mode_id move_mode_run( "run" );
 static const move_mode_id move_mode_walk( "walk" );
@@ -401,6 +421,15 @@ static const trait_id trait_SPINES( "SPINES" );
 static const trait_id trait_SUNLIGHT_DEPENDENT( "SUNLIGHT_DEPENDENT" );
 static const trait_id trait_THORNS( "THORNS" );
 static const trait_id trait_VISCOUS( "VISCOUS" );
+
+static bool fcl_mod_is_active()
+{
+    return world_generator && world_generator->active_world &&
+           std::find( world_generator->active_world->active_mod_order.begin(),
+                      world_generator->active_world->active_mod_order.end(),
+                      MOD_INFORMATION_catalegacy_future ) !=
+           world_generator->active_world->active_mod_order.end();
+}
 
 static const std::set<material_id> ferric = { material_iron, material_steel, material_budget_steel, material_ch_steel, material_hc_steel, material_lc_steel, material_mc_steel, material_qt_steel, material_budget_steel_chain, material_ch_steel_chain, material_hc_steel_chain, material_lc_steel_chain, material_mc_steel_chain, material_qt_steel_chain, material_copper_nickel };
 
@@ -1143,7 +1172,9 @@ double Character::aim_per_move( const item &gun, double recoil,
     aim_speed = std::max( aim_speed, MIN_RECOIL_IMPROVEMENT );
 
     // Never improve by more than the currently used sights permit.
-    return std::min( aim_speed, recoil - limit );
+    aim_speed = std::min( aim_speed, recoil - limit );
+
+    return calculate_by_enchantment( aim_speed, enchant_vals::mod::AIMING_SPEED );
 }
 
 void Character::mod_free_dodges( int added )
@@ -1565,6 +1596,8 @@ void Character::mount_creature( monster &z )
     z.add_effect( effect_ridden, 1_turns, true );
     if( z.has_effect( effect_tied ) ) {
         z.remove_effect( effect_tied );
+        z.remove_effect( effect_led_by_leash );
+        z.remove_effect( effect_leashed );
         if( z.tied_item ) {
             i_add( *z.tied_item );
             z.tied_item.reset();
@@ -1934,7 +1967,7 @@ void Character::on_dodge( Creature *source, float difficulty, float training_lev
             }
         }
     }
-    cata::lua_ui::dispatch_native_hook(
+    cata::lua_platform::dispatch_native_hook(
     "on_creature_dodged", {
         { "creature", static_cast<const Character *>( this ) },
         { "source", static_cast<const Creature *>( source ) },
@@ -2447,6 +2480,9 @@ void Character::process_turn()
         }
     }
     effect_on_conditions::process_effect_on_conditions( *this );
+#if defined(CATA_ENABLE_LUA_PLATFORM) && CATA_ENABLE_LUA_PLATFORM
+    cata::lua_platform::runtime_process_character_recurring( *this );
+#endif
 }
 
 // This must be called when any of the following change:
@@ -2586,6 +2622,8 @@ bool Character::practice( const skill_id &id, int amount, int cap, bool suppress
     // but perception also plays a role, representing both memory/attentiveness and catching on to how
     // the two apply to each other.
     float catchup_modifier = 1.0f + ( 2.0f * get_int() + get_per() ) / 24.0f; // 2 for an average person
+    catchup_modifier = calculate_by_enchantment( catchup_modifier,
+                       enchant_vals::mod::THEORETICAL_SKILL_CATCHUP_BONUS );
     float knowledge_modifier = 1.0f + get_int() /
                                40.0f; // 1.2 for an average person, always a bit higher than base amount
 
@@ -3154,9 +3192,9 @@ void Character::reset_stats()
         mod_dodge_bonus( 1 );   // Bonus if we're small
     }
 
-    if( cata::lua_ui::has_native_hook(
+    if( cata::lua_platform::has_native_hook(
             "on_character_reset_stats" ) ) {
-        cata::lua_ui::dispatch_native_hook(
+        cata::lua_platform::dispatch_native_hook(
         "on_character_reset_stats", {
             {
                 "character",
@@ -3356,6 +3394,22 @@ int Character::get_per_bonus() const
 int Character::get_int_bonus() const
 {
     return int_bonus;
+}
+
+int Character::get_primary_stat_value( const scaling_stat stat ) const
+{
+    switch( stat ) {
+        case STAT_STR:
+            return get_str();
+        case STAT_DEX:
+            return get_dex();
+        case STAT_INT:
+            return get_int();
+        case STAT_PER:
+            return get_per();
+        default:
+            cata_fatal( "Invalid primary character stat" );
+    }
 }
 
 int Character::get_enchantment_speed_bonus() const
@@ -4383,7 +4437,7 @@ void Character::mend_item( item_location &&obj, bool interactive )
             if( opts[menu.ret].second ) {
                 obj->remove_fault( opts[menu.ret].first );
             } else {
-                obj->set_fault( opts[menu.ret].first, true, nullptr );
+                obj->set_fault( opts[menu.ret].first, true, nullptr, true );
             }
         }
         return;
@@ -4409,7 +4463,7 @@ void Character::mend_item( item_location &&obj, bool interactive )
                     break;
                 }
             }
-            opt.doable &= fix.get_requirements().can_make_with_inventory( inv, is_crafting_component );
+            opt.doable &= fix.get_requirements().can_make_with_inventory( this, inv, is_crafting_component );
             mending_options.emplace_back( opt );
         }
     }
@@ -4449,8 +4503,9 @@ void Character::mend_item( item_location &&obj, bool interactive )
             const nc_color col = opt.doable ? c_white : c_light_gray;
 
             const requirement_data &reqs = fix.get_requirements();
-            auto tools = reqs.get_folded_tools_list( fold_width, col, inv );
-            auto comps = reqs.get_folded_components_list( fold_width, col, inv, is_crafting_component );
+            auto tools = reqs.get_folded_tools_list( this, fold_width, col, inv );
+            auto comps = reqs.get_folded_components_list( this, fold_width, col, inv,
+                         is_crafting_component );
 
             std::string descr = word_rewrap( obj.get_item()->get_fault_description( opt.fault ), 80 ) + "\n\n";
             for( const fault_id &fid : fix.faults_removed ) {
@@ -4658,25 +4713,13 @@ bool Character::invoke_item( item *used, const tripoint_bub_ms &pt,
                              int pre_obtain_moves )
 {
     if( used == nullptr ||
-        !cata::lua_ui::has_native_callback(
-            "iuse", used->typeId().str(), "on_use" ) ) {
+        !cata::lua_platform::has_platform_item_use_handler( used->typeId().str() ) ) {
         return false;
     }
-    const cata::lua_ui::native_callback_arguments payload = {
-        { "character", static_cast<const Character *>( this ) },
-        { "item", static_cast<const item *>( used ) },
-        { "action", std::string( "lua" ) },
-        { "tick", false },
-        {
-            "position", cata::lua_ui::native_callback_point {
-                "bub_ms", tripoint_rel_ms( pt.x(), pt.y(), pt.z() )
-            }
-        }
-    };
-    if( !cata::lua_ui::dispatch_native_callback(
-            "iuse", used->typeId().str(), "can_use", payload ) ||
-        !cata::lua_ui::dispatch_native_callback(
-            "iuse", used->typeId().str(), "on_use", payload ) ) {
+    const std::optional<int> result =
+        cata::lua_platform::invoke_platform_item_use_handler(
+            this, *used, &get_map(), pt );
+    if( !result ) {
         if( pre_obtain_moves >= 0 ) {
             set_moves( pre_obtain_moves );
         }
@@ -4740,27 +4783,6 @@ bool Character::invoke_item( item *used, const std::string &method, const tripoi
         set_moves( pre_obtain_moves );
         return false;
     }
-    const cata::lua_ui::native_callback_arguments callback_payload = {
-        { "character", static_cast<const Character *>( this ) },
-        { "item", static_cast<const item *>( actually_used ) },
-        { "action", method },
-        { "tick", false },
-        {
-            "position", cata::lua_ui::native_callback_point {
-                "bub_ms", tripoint_rel_ms( pt.x(), pt.y(), pt.z() )
-            }
-        }
-    };
-    if( !cata::lua_ui::dispatch_native_callback(
-            "iuse", actually_used->typeId().str(),
-            "can_use", callback_payload ) ||
-        !cata::lua_ui::dispatch_native_callback(
-            "iuse", actually_used->typeId().str(),
-            "on_use", callback_payload ) ) {
-        set_moves( pre_obtain_moves );
-        return false;
-    }
-
     std::optional<int> charges_used = actually_used->type->invoke( this, *actually_used,
                                       pt, method );
     if( !charges_used.has_value() ) {
@@ -5712,8 +5734,13 @@ void Character::fall_asleep( const time_duration &duration )
             cancel_activity();
         }
     }
-    add_effect( effect_sleep, duration );
-    get_event_bus().send<event_type::character_falls_asleep>( getID(), to_seconds<int>( duration ) );
+    if( has_flag( json_flag_CANNOT_SLEEP ) ) {
+        add_msg_if_player( m_info, _( "You cannot sleep!" ) );
+        cancel_activity();
+    } else {
+        add_effect( effect_sleep, duration );
+        get_event_bus().send<event_type::character_falls_asleep>( getID(), to_seconds<int>( duration ) );
+    }
 }
 
 std::map<bodypart_id, int> Character::bonus_item_warmth() const
@@ -5902,7 +5929,7 @@ const
                   dmg_type]( const item_location & it ) {
         damage_instance di;
         roll_damage( dmg_type, false, di, true, *it, attack_vector_id::NULL_ID(),
-                     sub_bodypart_str_id::NULL_ID(), 1.f );
+                     sub_bodypart_str_id::NULL_ID(), 1.f, 0.f );
         for( damage_unit &du : di.damage_units ) {
             if( du.type == dmg_type && best_weapon.first < du.amount ) {
                 best_weapon = std::make_pair( du.amount, *it );
@@ -6556,7 +6583,7 @@ void Character::place_corpse( map *here )
             cbm.set_flag( flag_FILTHY );
             cbm.set_flag( flag_NO_STERILE );
             cbm.set_flag( flag_NO_PACKED );
-            cbm.set_fault( fault_bionic_salvaged );
+            cbm.set_fault( fault_bionic_salvaged, false, nullptr, true );
             body.put_in( cbm, pocket_type::CORPSE );
         }
     }
@@ -7007,6 +7034,16 @@ void Character::process_one_effect( effect &it, bool is_new )
         }
     }
 
+    // Handle focus
+    val = get_effect( "FOCUS", reduced );
+    if( val != 0 ) {
+        mod = 1;
+        if( is_new || it.activated( calendar::turn, "FOCUS", val, reduced, mod ) ) {
+            mod_focus( bound_mod_to_vals( get_focus(), val, it.get_max_val( "FOCUS", reduced ),
+                                          it.get_min_val( "FOCUS", reduced ) ) );
+        }
+    }
+
     // Handle Radiation
     val = get_effect( "RAD", reduced );
     if( val != 0 ) {
@@ -7158,15 +7195,15 @@ void Character::process_one_effect( effect &it, bool is_new )
     const std::string body_part =
         it.get_bp() == bodypart_str_id::NULL_ID() ?
         std::string() : it.get_bp().id().str();
-    const cata::lua_ui::native_callback_arguments payload = {
+    const cata::lua_platform::native_callback_arguments payload = {
         { "character", static_cast<const Character *>( this ) },
         {
-            "effect", cata::lua_ui::native_callback_id {
+            "effect", cata::lua_platform::native_callback_id {
                 "effect", it.get_id().str()
             }
         },
         {
-            "body_part", cata::lua_ui::native_callback_id {
+            "body_part", cata::lua_platform::native_callback_id {
                 "body_part", body_part
             }
         },
@@ -7174,17 +7211,17 @@ void Character::process_one_effect( effect &it, bool is_new )
     };
     const bool dispatch_added =
         it.has_flag( flag_EFFECT_LUA_ON_ADDED ) &&
-        cata::lua_ui::has_native_hook(
+        cata::lua_platform::has_native_hook(
             "on_character_effect_added" );
     const bool dispatch_tick =
         it.has_flag( flag_EFFECT_LUA_ON_TICK ) &&
-        cata::lua_ui::has_native_hook( "on_character_effect" );
+        cata::lua_platform::has_native_hook( "on_character_effect" );
     if( dispatch_added ) {
-        cata::lua_ui::dispatch_native_hook(
+        cata::lua_platform::dispatch_native_hook(
             "on_character_effect_added", payload );
     }
     if( dispatch_tick ) {
-        cata::lua_ui::dispatch_native_hook(
+        cata::lua_platform::dispatch_native_hook(
             "on_character_effect", payload );
     }
 }
@@ -7248,7 +7285,7 @@ void Character::process_effects()
         int intensity;
     };
     const bool has_lua_effect_hook =
-        cata::lua_ui::has_native_hook( "on_character_effect" );
+        cata::lua_platform::has_native_hook( "on_character_effect" );
     std::vector<lua_effect_tick> lua_effect_ticks;
     //Human only effects
     for( std::pair<const efftype_id, std::map<bodypart_id, effect>> &elem : *effects ) {
@@ -7269,19 +7306,19 @@ void Character::process_effects()
         }
     }
     for( const lua_effect_tick &tick : lua_effect_ticks ) {
-        cata::lua_ui::dispatch_native_hook(
+        cata::lua_platform::dispatch_native_hook(
         "on_character_effect", {
             {
                 "character",
                 static_cast<const Character *>( this )
             },
             {
-                "effect", cata::lua_ui::native_callback_id {
+                "effect", cata::lua_platform::native_callback_id {
                     "effect", tick.effect
                 }
             },
             {
-                "body_part", cata::lua_ui::native_callback_id {
+                "body_part", cata::lua_platform::native_callback_id {
                     "body_part", tick.body_part
                 }
             },
@@ -7411,8 +7448,9 @@ void Character::stagger()
 
 bool Character::can_sleep()
 {
-    if( has_effect( effect_meth ) ) {
-        // Sleep ain't happening until that meth wears off completely.
+
+    if( has_flag( json_flag_CANNOT_SLEEP ) ) {
+        // Sleep ain't happening
         return false;
     }
 
@@ -7434,6 +7472,9 @@ bool Character::can_sleep()
     int sleepy = get_comfort_at( pos_bub() ).comfort;
     if( has_addiction( addiction_sleeping_pill ) ) {
         sleepy -= 4;
+    }
+    if( addiction_level( addiction_cannabis ) > 5 && !has_effect( effect_weed_high ) ) {
+        sleepy -= 1;
     }
     sleepy = enchantment_cache->modify_value( enchant_vals::mod::SLEEPY, sleepy );
     if( get_sleepiness() < sleepiness_levels::TIRED + 1 ) {
@@ -7985,9 +8026,9 @@ bool Character::avoid_trap( const tripoint_bub_ms &pos, const trap &tr ) const
     /** @EFFECT_DODGE increases chance to avoid traps */
     // Sensitivity slightly shifts trap avoidance, ±10% across 0..400.
     const double sens_mult = clamp( 1.0 + 0.1 * std::log( std::clamp( get_sensitive(), 1,
-                                           400 ) / 100.0 ) / std::log( 4.0 ), 0.9, 1.1 );
+                                    400 ) / 100.0 ) / std::log( 4.0 ), 0.9, 1.1 );
     int myroll = dice( 3, round( ( get_dex() + get_skill_level( skill_dodge ) * 1.5 ) *
-                                  sens_mult ) );
+                                 sens_mult ) );
     int traproll;
     if( tr.can_see( pos, *this ) ) {
         traproll = dice( 3, tr.get_avoidance() );

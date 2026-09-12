@@ -1,5 +1,10 @@
 #include "damage.h"
 
+#include <calendar.h>
+#include <color.h>
+#include <flat_set.h>
+#include <translation.h>
+#include <type_id.h>
 #include <algorithm>
 #include <map>
 #include <memory>
@@ -9,8 +14,6 @@
 
 #include "bodypart.h"
 #include "cata_utility.h"
-#include "catalua_platform_content.h"
-#include "catalua_platform_runtime.h"
 #include "creature.h"
 #include "debug.h"
 #include "dialogue.h"
@@ -19,6 +22,8 @@
 #include "generic_factory.h"
 #include "item.h"
 #include "json.h"
+#include "lua_platform_content.h"
+#include "lua_platform_runtime.h"
 #include "monster.h"
 #include "mtype.h"
 #include "subbodypart.h"
@@ -135,6 +140,10 @@ void damage_type::load( const JsonObject &jo, std::string_view src )
     optional( jo, was_loaded, "skill", skill, skill_id::NULL_ID() );
     optional( jo, was_loaded, "physical", physical );
     optional( jo, was_loaded, "melee_only", melee_only );
+    optional( jo, was_loaded, "melee_crit_dmg_mult", melee_crit_dmg_mult, 0.0 );
+    optional( jo, was_loaded, "melee_crit_dmg_mult_per_skill", melee_crit_dmg_mult_per_skill, 0.0 );
+    optional( jo, was_loaded, "melee_crit_armor_mult", melee_crit_armor_mult, 1.0 );
+    optional( jo, was_loaded, "melee_crit_armor_penetration", melee_crit_armor_penetration, 0.0 );
     optional( jo, was_loaded, "edged", edged );
     optional( jo, was_loaded, "environmental", env );
     optional( jo, was_loaded, "material_required", material_required );

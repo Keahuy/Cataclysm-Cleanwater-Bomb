@@ -1,9 +1,11 @@
 #include "faction_camp.h" // IWYU pragma: associated
 
+#include <veh_type.h>
 #include <algorithm>
 #include <array>
 #include <climits>
 #include <cmath>
+#include <cstddef>
 #include <functional>
 #include <list>
 #include <map>
@@ -11,7 +13,6 @@
 #include <numeric>
 #include <optional>
 #include <set>
-#include <cstddef>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -21,6 +22,9 @@
 #include "activity_actor_definitions.h"
 #include "avatar.h"
 #include "basecamp.h"
+#if defined(CATA_ENABLE_LUA_PLATFORM) && CATA_ENABLE_LUA_PLATFORM
+    #include "lua_platform_handle.h"
+#endif
 #include "build_reqs.h"
 #include "cached_options.h"
 #include "calendar.h"
@@ -98,8 +102,8 @@
 #include "translation.h"
 #include "translations.h"
 #include "type_id.h"
-#include "uilist.h"
 #include "ui_manager.h"
+#include "uilist.h"
 #include "units.h"
 #include "value_ptr.h"
 #include "vehicle.h"
@@ -1926,8 +1930,8 @@ void basecamp::start_upgrade( const mission_id &miss_id )
     const requirement_data &reqs = bld_reqs.consolidated_reqs;
 
     //Stop upgrade if you don't have materials
-    if( reqs.can_make_with_inventory( _inv, making.get_component_filter(), 1, craft_flags::none,
-                                      false ) ) {
+    if( reqs.can_make_with_inventory( nullptr, _inv, making.get_component_filter(), 1,
+                                      craft_flags::none, false ) ) {
         bool must_feed = !making.has_flag( "NO_FOOD_REQ" );
 
         basecamp_action_components components( making, miss_id.mapgen_args, 1, *this );
@@ -1984,8 +1988,18 @@ void basecamp::start_upgrade( const mission_id &miss_id )
     }
 }
 
-void basecamp::remove_camp( bool remove_from_overmap ) const
+void basecamp::remove_camp( bool remove_from_overmap )
 {
+    std::string removal_error;
+    if( !platform_can_remove( removal_error ) ) {
+        return;
+    }
+    if( !platform_retire_tasks_for_camp() ) {
+        return;
+    }
+#if defined(CATA_ENABLE_LUA_PLATFORM) && CATA_ENABLE_LUA_PLATFORM
+    cata::lua_platform::retire_camp_handle_identity( *this );
+#endif
     std::set<tripoint_abs_omt> &known_camps = get_player_character().camps;
     known_camps.erase( omt_pos );
 
@@ -2699,7 +2713,7 @@ void basecamp::start_fortifications( const mission_id &miss_id, float exertion_l
     if( !query_yn( _( "Trip Estimate:\n%s" ), camp_trip_description( total_time, build_time,
                    travel_time, dist, trips, need_food ) ) ) {
         return;
-    } else if( !making.deduped_requirements().can_make_with_inventory( _inv,
+    } else if( !making.deduped_requirements().can_make_with_inventory( nullptr, _inv,
                making.get_component_filter(), ( fortify_om.size() * 2 ) - 2 ) ) {
         popup( _( "You don't have the material to build the fortification." ) );
         return;
@@ -3588,13 +3602,9 @@ std::pair<size_t, std::string> basecamp::farm_action( const point_rel_omt &dir, 
                                     { "actor_is_npc", 1.0 }
                                 };
                                 Character &actor = *comp;
-                                const furn_t &current_furn = farm_map.furn( pos ).obj();
-                                if( current_furn.plant ) {
-                                    iexamine::run_plant_eocs( current_furn.plant->eoc_on_harvest, actor,
-                                                              *farm_map_ptr, bub_pos, *seed, stage, stage, {}, num_ctx );
-                                }
-                                iexamine::run_plant_eocs( seed_type.seed->eoc_on_harvest, actor, *farm_map_ptr,
-                                                          bub_pos, *seed, stage, stage, {}, num_ctx );
+                                iexamine::run_plant_lifecycle_event(
+                                    "harvest", actor, *farm_map_ptr, bub_pos, *seed,
+                                    stage, stage, {}, num_ctx );
 
                                 for( item &i : iexamine::get_harvest_items( seed_type, plant_count,
                                         seed_cnt, true ) ) {
@@ -4541,11 +4551,16 @@ bool basecamp::survey_return( const mission_id &miss_id )
         const recipe_id expansion_type = base_camps::select_camp_option( pos_expansions,
                                          _( "Select an expansion:" ) );
 
+        std::string placement_error;
+        const bool placement_is_valid =
+            expansion_type != recipe_id::NULL_ID() &&
+            platform_validate_expansion_placement( expansion_type.str(), where, placement_error );
+
         bool mirror_horizontal;
         bool mirror_vertical;
         int rotation;
 
-        if( expansion_type == recipe_id::NULL_ID() ||
+        if( !placement_is_valid ||
             !extract_and_check_orientation_flags( expansion_type,
                     dir,
                     mirror_horizontal,
@@ -4680,7 +4695,7 @@ int basecamp::recipe_batch_max( const recipe &making ) const
                                                  max_batch + batch_size ) );
             int food_req = time_to_food( work_days );
             bool can_make = making.deduped_requirements().can_make_with_inventory(
-                                _inv, making.get_component_filter(), max_batch + batch_size );
+                                nullptr, _inv, making.get_component_filter(), max_batch + batch_size );
             if( can_make && fac()->food_supply().kcal() > food_req ) {
                 max_batch += batch_size;
             } else {
@@ -4754,6 +4769,11 @@ void basecamp::make_corpse_from_group( const std::vector<MonsterGroupResult> &gr
 {
     for( const MonsterGroupResult &monster : group ) {
         const mtype_id target = monster.id;
+
+        // This prevents followers from bringing back human corpses if a null is rolled on the hunting mongroups
+        if( target == mtype_id::NULL_ID() ) {
+            continue;
+        }
         item result = item::make_corpse( target, calendar::turn, "" );
         if( !result.is_null() ) {
             int num_to_spawn = monster.pack_size;
@@ -5320,8 +5340,8 @@ std::string basecamp::craft_description( const recipe_id &itm )
     std::vector<std::string> component_print_buffer;
     int pane = FULL_SCREEN_WIDTH;
     const requirement_data &req = making.simple_requirements();
-    auto tools = req.get_folded_tools_list( pane, c_white, _inv, 1 );
-    auto comps = req.get_folded_components_list( pane, c_white, _inv,
+    auto tools = req.get_folded_tools_list( nullptr, pane, c_white, _inv, 1 );
+    auto comps = req.get_folded_components_list( nullptr, pane, c_white, _inv,
                  making.get_component_filter(), 1 );
 
     component_print_buffer.insert( component_print_buffer.end(), tools.begin(), tools.end() );

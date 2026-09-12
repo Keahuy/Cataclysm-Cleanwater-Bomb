@@ -1,7 +1,8 @@
-#include "catalua_platform_content.h"
-
-#include "shop_cons_rate.h"
-
+#include <character.h>
+#include <string_id.h>
+#include <translation.h>
+#include <units.h>
+#include "lua_platform_runtime.h"
 #include <algorithm>
 
 #include "avatar.h"
@@ -15,7 +16,9 @@
 #include "item_category.h"
 #include "item_group.h"
 #include "itype.h"
+#include "lua_platform_content.h"
 #include "npc.h"
+#include "shop_cons_rate.h"
 
 namespace
 {
@@ -33,8 +36,16 @@ bool icg_entry::operator==( icg_entry const &rhs ) const
 
 bool icg_entry::matches( item const &it, npc const &beta ) const
 {
-    const_dialogue temp( get_const_talker_for( get_avatar() ), get_const_talker_for( beta ) );
+    return matches( it, beta, get_avatar() );
+}
+
+bool icg_entry::matches( item const &it, npc const &beta,
+                         const Character &counterparty ) const
+{
+    const_dialogue temp( get_const_talker_for( counterparty ),
+                         get_const_talker_for( beta ) );
     return ( !condition || condition( temp ) ) &&
+           ( !platform_condition || platform_condition( it, beta ) ) &&
            ( itype.is_empty() || it.typeId() == itype ) &&
            ( category.is_empty() || it.get_category_shallow().id == category ) &&
            ( item_group.is_empty() ||
@@ -263,14 +274,40 @@ icg_entry const *shopkeeper_blacklist::matches( item const &it, npc const &beta 
     return nullptr;
 }
 
-icg_entry const *shopkeeper_whitelist::matches( item const &it, npc const &beta ) const
+icg_entry const *shopkeeper_blacklist::matches(
+    item const &it, npc const &beta, const Character &counterparty ) const
 {
     auto const el = std::find_if( entries.begin(), entries.end(),
-    [&it, &beta]( icg_entry const & rit ) {
-        return rit.matches( it, beta );
+    [&it, &beta, &counterparty]( icg_entry const & rit ) {
+        return rit.matches( it, beta, counterparty );
     } );
     if( el != entries.end() ) {
         return &*el;
+    }
+
+    return nullptr;
+}
+
+icg_entry const *shopkeeper_whitelist::matches( item const &it, npc const &beta ) const
+{
+    return matches( it, beta, get_avatar() );
+}
+
+icg_entry const *shopkeeper_whitelist::matches(
+    item const &it, npc const &beta, const Character &counterparty ) const
+{
+    auto const el = std::find_if( entries.begin(), entries.end(),
+    [&it, &beta, &counterparty]( icg_entry const & rit ) {
+        return rit.matches( it, beta, counterparty );
+    } );
+    if( el != entries.end() ) {
+        return &*el;
+    }
+
+    if( !lua_predicate.empty() &&
+        cata::lua_platform::invoke_shopkeeper_whitelist_handler(
+            lua_mod_id, lua_predicate, it, beta ).value_or( false ) ) {
+        return &lua_match;
     }
 
     return nullptr;

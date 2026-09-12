@@ -1,20 +1,30 @@
-#include "cata_catch.h"
+#include <algorithm>
+#include <memory>
+#if !defined(CATA_ENABLE_LUA_PLATFORM) || !CATA_ENABLE_LUA_PLATFORM
+    #include <filesystem>
+    #include <string>
+    #include "lua_platform_loader.h"
+#endif
+
+#include <cata_path.h>
+#include <type_id.h>
+#include <functional>
+#include <vector>
 
 #include "cached_options.h"
+#include "cata_catch.h"
 #include "cata_scope_helpers.h"
-#include "catalua_platform.h"
+#include "mod_id_compat.h"
 #include "mod_manager.h"
 #include "path_info.h"
 #include "worldfactory.h"
 
-#include <string>
-#include <vector>
-
+static const mod_id MOD_INFORMATION_Lua_First_Example( "Lua_First_Example" );
 static const mod_id MOD_INFORMATION_dda( "dda" );
+static const mod_id MOD_INFORMATION_test_builtin_platform_mod( "test_builtin_platform_mod" );
 static const mod_id MOD_INFORMATION_test_third_party_mod( "test_third_party_mod" );
 static const mod_id MOD_INFORMATION_test_third_party_mod_dda( "test_third_party_mod#dda" );
 static const mod_id MOD_INFORMATION_test_user_mod( "test_user_mod" );
-static const mod_id MOD_INFORMATION_test_builtin_platform_mod( "test_builtin_platform_mod" );
 
 TEST_CASE( "unexpected_builtin_mod_detection", "[mod_manager]" )
 {
@@ -52,7 +62,7 @@ TEST_CASE( "unexpected_builtin_mod_detection", "[mod_manager]" )
     CHECK_FALSE( is_unexpected_builtin_mod( third_party_mod ) );
 }
 
-#if !defined(CATA_ENABLE_LUA_UI) || !CATA_ENABLE_LUA_UI
+#if !defined(CATA_ENABLE_LUA_PLATFORM) || !CATA_ENABLE_LUA_PLATFORM
 TEST_CASE( "lua_first_platform_disabled_build_rejects_runtime_sources",
            "[mod_manager][lua][platform]" )
 {
@@ -61,7 +71,7 @@ TEST_CASE( "lua_first_platform_disabled_build_rejects_runtime_sources",
     REQUIRE( world_generator != nullptr );
     mod_manager &manager = world_generator->get_mod_manager();
     manager.refresh_mod_list();
-    const mod_id bundled_example( "Lua_First_Example" );
+    const mod_id &bundled_example = MOD_INFORMATION_Lua_First_Example;
     REQUIRE( bundled_example.is_valid() );
     CHECK( bundled_example->lua_platform_version ==
            cata::lua_platform::platform_version );
@@ -80,9 +90,50 @@ TEST_CASE( "lua_first_platform_disabled_build_rejects_runtime_sources",
     CHECK( cata::lua_platform::loaded_mod_ids().empty() );
 
     REQUIRE( cata::lua_platform::prepare_mods( {}, error ) );
-    REQUIRE( cata::lua_platform::apply_prepared_content( error ) );
+    const bool applied = cata::lua_platform::apply_prepared_content( error );
+    INFO( error );
+    REQUIRE( applied );
     REQUIRE( cata::lua_platform::validate_finalized_prepared_content( error ) );
     cata::lua_platform::commit_prepared_mods();
     CHECK( error.empty() );
 }
 #endif
+
+
+#if defined(CATA_ENABLE_LUA_PLATFORM) && CATA_ENABLE_LUA_PLATFORM
+TEST_CASE( "lua_mod_discovery_notifies_once_across_catalog_refreshes",
+           "[mod_manager][lua][platform][loader]" )
+{
+    // The bundled Platform example ensures that the real discovery path has
+    // Lua candidates. Supplying a notice callback keeps this test noninteractive.
+    int notices = 0;
+    mod_manager manager( [&notices]() {
+        ++notices;
+    } );
+    const std::vector<mod_id> discovered = manager.all_mods();
+    REQUIRE( std::find( discovered.begin(), discovered.end(),
+                        MOD_INFORMATION_Lua_First_Example ) != discovered.end() );
+    CHECK( notices == 1 );
+    manager.refresh_mod_list();
+    CHECK( notices == 1 );
+}
+#endif
+
+TEST_CASE( "core_pack_is_registered_once_with_legacy_lookup", "[mod_manager][core_id]" )
+{
+    REQUIRE( world_generator != nullptr );
+    const mod_id core( "ccb" );
+    const mod_id legacy( "dda" );
+    REQUIRE( core.is_valid() );
+    REQUIRE( legacy.is_valid() );
+    CHECK( &core.obj() == &legacy.obj() );
+    CHECK( core->core );
+    CHECK( core->ident == core );
+    const auto available = world_generator->get_mod_manager().all_mods();
+    CHECK( std::count( available.begin(), available.end(), core ) == 1 );
+    CHECK( std::count( available.begin(), available.end(), legacy ) == 0 );
+    // TEST_DATA deliberately declares both names, like a transitional external Mod.
+    const mod_id fixture( "test_data" );
+    REQUIRE( fixture.is_valid() );
+    CHECK( fixture->dependencies == std::vector<mod_id> { core } );
+}

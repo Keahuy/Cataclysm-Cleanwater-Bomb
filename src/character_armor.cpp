@@ -2,6 +2,7 @@
 #include <list>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -32,6 +33,9 @@
 #include "type_id.h"
 #include "units.h"
 #include "viewer.h"
+
+struct weakpoint;
+struct weakpoint_attack;
 
 static const bionic_id bio_ads( "bio_ads" );
 
@@ -92,15 +96,11 @@ int Character::get_armor_type( const damage_type_id &dt, bodypart_id bp ) const
     return ret + mutation_armor( bp, dt ) + bp->damage_resistance( dt );
 }
 
-std::map<bodypart_id, int> Character::get_all_armor_type( const damage_type_id &dt,
-        const std::map<bodypart_id, std::vector<const item *>> &clothing_map ) const
+std::map<bodypart_id, int> Character::get_all_armor_type( const damage_type_id &dt ) const
 {
     std::map<bodypart_id, int> ret;
     for( const bodypart_id &bp : get_all_body_parts() ) {
         ret.emplace( bp, get_armor_type( dt, bp ) );
-        for( const item *it : clothing_map.at( bp ) ) {
-            ret[bp] += it->resist( dt, false, bp );
-        }
     }
     return ret;
 }
@@ -153,19 +153,18 @@ const weakpoint *Character::absorb_hit( const weakpoint_attack &attack, const bo
 {
     ( void )attack;
     ( void )wp;
-    absorb_damage( bp, std::nullopt, dam, false, damage_armor );
+    absorb_damage( bp, std::nullopt, dam, damage_armor );
     return nullptr;
 }
 
 void Character::absorb_hit( const sub_bodypart_id &sbp, damage_instance &dam,
-                            bool allow_torso_neck_fallback, bool damage_armor )
+                            bool damage_armor )
 {
-    absorb_damage( sbp->parent.id(), sbp, dam, allow_torso_neck_fallback, damage_armor );
+    absorb_damage( sbp->parent.id(), sbp, dam, damage_armor );
 }
 
 void Character::absorb_damage( const bodypart_id &bp, const std::optional<sub_bodypart_id> &sbp,
-                               damage_instance &dam, bool allow_torso_neck_fallback,
-                               bool damage_armor )
+                               damage_instance &dam, bool damage_armor )
 {
     std::list<item> worn_remains;
     bool armor_destroyed = false;
@@ -219,7 +218,7 @@ void Character::absorb_damage( const bodypart_id &bp, const std::optional<sub_bo
         adjust_taken_damage_by_enchantments( elem );
 
         worn.absorb_damage( *this, elem, bp, worn_remains, armor_destroyed, sbp,
-                            allow_torso_neck_fallback, damage_armor );
+                            damage_armor );
 
         passive_absorb_hit( bp, elem );
 
@@ -275,7 +274,7 @@ bool Character::armor_absorb( damage_unit &du, item &armor, const bodypart_id &b
 
     // check if the armor was damaged - damage_armor=false still mitigates but does not degrade durability
     const double dmg_mult = damage_armor ? calculate_by_enchantment( 1,
-                                        enchant_vals::mod::EQUIPMENT_DAMAGE_CHANCE ) : 0.0;
+                            enchant_vals::mod::EQUIPMENT_DAMAGE_CHANCE ) : 0.0;
     item::armor_status damaged = armor.damage_armor_durability( du, pre_mitigation, bp, dmg_mult,
                                  this );
 
@@ -288,7 +287,7 @@ bool Character::armor_absorb( damage_unit &du, item &armor, const bodypart_id &b
 }
 
 bool Character::armor_absorb( damage_unit &du, item &armor, const bodypart_id &bp, int roll,
-                           bool damage_armor ) const
+                              bool damage_armor ) const
 {
     item::cover_type ctype = item::get_cover_type( du.type );
 
@@ -314,7 +313,7 @@ bool Character::armor_absorb( damage_unit &du, item &armor, const bodypart_id &b
 
     // check if the armor was damaged - damage_armor=false still mitigates but does not degrade durability
     const double dmg_mult = damage_armor ? calculate_by_enchantment( 1,
-                                        enchant_vals::mod::EQUIPMENT_DAMAGE_CHANCE ) : 0.0;
+                            enchant_vals::mod::EQUIPMENT_DAMAGE_CHANCE ) : 0.0;
     item::armor_status damaged = armor.damage_armor_durability( du, pre_mitigation, bp, dmg_mult,
                                  this );
 
@@ -333,7 +332,7 @@ bool Character::ablative_armor_absorb( damage_unit &du, item &armor, const sub_b
 
     item::cover_type ctype = item::get_cover_type( du.type );
     const double dmg_mult = damage_armor ? calculate_by_enchantment( 1,
-                                        enchant_vals::mod::EQUIPMENT_DAMAGE_CHANCE ) : 0.0;
+                            enchant_vals::mod::EQUIPMENT_DAMAGE_CHANCE ) : 0.0;
 
     for( item_pocket *const pocket : armor.get_ablative_pockets() ) {
         // if the pocket is ablative and not empty we should use its values

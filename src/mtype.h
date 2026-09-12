@@ -44,6 +44,7 @@ class JsonObject;
 namespace cata::lua_platform
 {
 class content_transaction;
+class creatures_content_transaction;
 } // namespace cata::lua_platform
 
 // These are triggers which may affect the monster's anger or morale.
@@ -262,6 +263,13 @@ struct pet_food_data {
     void deserialize( const JsonObject &data );
 };
 
+struct monster_block_data {
+    int chance = 0;
+    int effectiveness = 0;
+    int count = 0;
+    bool ranged = false;
+};
+
 /** movement data */
 struct move_skills_data {
     // 10 means max movecost of 500 * terrain-difficulty with 0 skill
@@ -297,6 +305,8 @@ struct monster_death_effect {
     std::optional<effect_on_condition_id> eoc;
     translation death_message;
     mdeath_type corpse_type = mdeath_type::NORMAL;
+    std::string lua_platform_mod;
+    std::string lua_platform_handler;
 
     void load( const JsonObject &jo );
     void deserialize( const JsonObject &data );
@@ -342,6 +352,7 @@ struct mtype {
     private:
         friend class MonsterGenerator;
         friend class cata::lua_platform::content_transaction;
+        friend class cata::lua_platform::creatures_content_transaction;
 
         enum_bitset<mon_trigger> anger;
         enum_bitset<mon_trigger> fear;
@@ -443,6 +454,8 @@ struct mtype {
     public:
         // special attack frequencies and function pointers
         std::map<std::string, mtype_special_attack> special_attacks;
+        std::string lua_platform_attack_mod;
+        std::map<std::string, std::string> lua_platform_attack_handlers;
         /** Emission sources that cycle each turn the monster remains alive */
         std::map<emit_id, time_duration> emit_fields;
         std::optional<resistances> armor_proportional; /**load-time only*/
@@ -503,6 +516,9 @@ struct mtype {
         int melee_dice = 0;     /** number of dice of bonus bashing damage on melee hit */
         int melee_sides = 0;    /** number of sides those dice have */
         int melee_dice_ap = 0;  /** ap value of the melee dice*/
+
+        monster_block_data
+        block; /**monsters ability to block attacks for reduced damage defaults to unable to block */
 
         int grab_strength = 1;    /**intensity of the effect_grabbed applied*/
         int sk_dodge = 0;       /** dodge skill */

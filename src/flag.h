@@ -19,6 +19,7 @@ template <typename T> class generic_factory;
 namespace cata::lua_platform
 {
 class content_transaction;
+class items_content_transaction;
 namespace detail
 {
 struct json_flag_snapshot_entry {
@@ -163,6 +164,7 @@ extern const flag_id flag_DIMENSIONAL_ANCHOR;
 extern const flag_id flag_DIRTY;
 extern const flag_id flag_DISABLE_SIGHTS;
 extern const flag_id flag_DROP_ACTION_ONLY_IF_LIQUID;
+extern const flag_id flag_DURABLE;
 extern const flag_id flag_DURABLE_MELEE;
 extern const flag_id flag_EATEN_COLD;
 extern const flag_id flag_EATEN_HOT;
@@ -481,6 +483,7 @@ class json_flag
         friend class DynamicDataLoader;
         friend class generic_factory<json_flag>;
         friend class cata::lua_platform::content_transaction;
+        friend class cata::lua_platform::items_content_transaction;
         friend std::vector<cata::lua_platform::detail::json_flag_snapshot_entry>
         cata::lua_platform::detail::json_flag_snapshot();
 

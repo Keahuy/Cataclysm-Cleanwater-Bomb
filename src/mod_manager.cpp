@@ -1,17 +1,23 @@
+#include "mod_id_compat.h"
 #include "mod_manager.h"
 
+#include <cata_path.h>
+#include <pimpl.h>
+#include <translation.h>
+#include <translations.h>
+#include <type_id.h>
 #include <algorithm>
+#include <array>
 #include <filesystem>
 #include <functional>
 #include <iterator>
+#include <iostream>
 #include <memory>
-#include <ostream>
 #include <queue>
 #include <system_error>
 
-#include "builtin_mods.h"
+#include "builtin_mods.h" // IWYU pragma: keep
 #include "cached_options.h"
-#include "catalua_platform.h"
 #include "cata_utility.h"
 #include "debug.h"
 #include "dependency_tree.h"
@@ -22,6 +28,7 @@
 #include "input_context.h"
 #include "json.h"
 #include "localized_comparator.h"
+#include "lua_platform_loader.h"
 #include "output.h"
 #include "path_info.h"
 #include "string_formatter.h"
@@ -37,7 +44,7 @@ static std::string bounded_lua_platform_diagnostic( const std::string &reason )
 {
     std::string result = reason;
     std::replace( result.begin(), result.end(), '\0', '?' );
-    static constexpr std::string_view suffix = "... [diagnostic truncated]";
+    static constexpr std::string_view suffix = "…[diagnostic truncated]";
     if( result.size() > LUA_PLATFORM_DIAGNOSTIC_LIMIT ) {
         result.resize( LUA_PLATFORM_DIAGNOSTIC_LIMIT - suffix.size() );
         result += std::string( suffix );
@@ -132,9 +139,9 @@ mod_id get_mod_base_id_from_src( mod_id src )
     mod_id base_mod_id;
     size_t split_loc = src.str().find( '#' );
     if( split_loc == std::string::npos ) {
-        return src;
+        return canonical_mod_id( src );
     } else {
-        return mod_id( src.str().substr( 0, split_loc ) );
+        return canonical_mod_id( mod_id( src.str().substr( 0, split_loc ) ) );
     }
 }
 
@@ -154,7 +161,7 @@ const MOD_INFORMATION &string_id<MOD_INFORMATION>::obj() const
 template<>
 bool string_id<MOD_INFORMATION>::is_valid() const
 {
-    return world_generator->get_mod_manager().mod_map.count( *this ) > 0;
+    return world_generator->get_mod_manager().mod_map.count( canonical_mod_id( *this ) ) > 0;
 }
 
 std::string MOD_INFORMATION::name() const
@@ -245,7 +252,32 @@ void mod_migrations::check()
     }
 }
 
-mod_manager::mod_manager()
+static void show_lua_execution_notice()
+{
+    const std::string message = _(
+                                    "Lua Mods are executable programs with access to your files and system.  "
+                                    "CCB does not sandbox them or protect your system from their actions.\n\n"
+                                    "Reading the Mod list can already execute mod.lua metadata, before a Mod "
+                                    "is selected for a world.  Only install Mods you choose to trust.  "
+                                    "Native libraries can also crash the game.\n\n"
+                                    "Continuing will scan the installed Lua Mods.  This notice appears once "
+                                    "per game session." );
+#if !defined(HEADLESS)
+    if( !test_mode ) {
+        // The manager is constructed before load_static_data initializes
+        // keybindings. Accept a raw key instead of requiring CONFIRM/QUIT.
+        popup( message + "\n\n" + _( "Press any key to continue." ), PF_GET_KEY );
+        return;
+    }
+#endif
+    // --check-mods sets test_mode without initializing the UI. It must still
+    // receive the execution notice, just like a headless launcher.
+    std::cerr << message << std::endl;
+}
+
+mod_manager::mod_manager( std::function<void()> execution_notice ) :
+    lua_execution_notice( execution_notice ? std::move( execution_notice ) :
+                          show_lua_execution_notice )
 {
     refresh_mod_list();
     set_usable_mods();
@@ -294,6 +326,13 @@ void mod_manager::refresh_mod_list()
     }
     if( file_exist( PATH_INFO::mods_user_default() ) ) {
         load_mod_info( PATH_INFO::mods_user_default() );
+    }
+
+    // Apply aliases after both JSON and Lua metadata have been discovered,
+    // before default lists and the dependency graph consume their IDs.
+    for( auto &entry : mod_map ) {
+        canonicalize_mod_list( entry.second.dependencies );
+        canonicalize_mod_list( entry.second.conflicts );
     }
 
     if( !set_default_mods( MOD_INFORMATION_user_default ) ) {
@@ -402,6 +441,14 @@ void mod_manager::load_lua_platform_mod( const cata_path &root )
         // only its optional Platform entry.
         record_rejection( "Lua-first Platform is not enabled in this build" );
         return;
+    }
+
+    // Discovery itself executes metadata, so a world-load notice is too late.
+    // Keep this before read_mod_definition and before accepting main.lua-only
+    // candidates. Refreshing the catalog does not repeat the session notice.
+    if( !lua_execution_notice_shown ) {
+        lua_execution_notice();
+        lua_execution_notice_shown = true;
     }
 
     if( has_metadata ) {
@@ -662,6 +709,8 @@ void mod_manager::load_modfile( const JsonObject &jo, const cata_path &path )
     optional( jo, false, "version", modfile.version );
     optional( jo, false, "dependencies", modfile.dependencies );
     optional( jo, false, "conflicts", modfile.conflicts );
+    canonicalize_mod_list( modfile.dependencies );
+    canonicalize_mod_list( modfile.conflicts );
     optional( jo, false, "core", modfile.core, false );
     optional( jo, false, "obsolete", modfile.obsolete, false );
     optional( jo, false, "loading_images", modfile.loading_images );
@@ -685,6 +734,7 @@ void mod_manager::load_modfile( const JsonObject &jo, const cata_path &path )
 bool mod_manager::set_default_mods( const t_mod_list &mods )
 {
     default_mods = mods;
+    canonicalize_mod_list( default_mods );
     return write_to_file( PATH_INFO::mods_user_default(), [&]( std::ostream & fout ) {
         JsonOut json( fout, true ); // pretty-print
         json.start_object();
@@ -692,7 +742,7 @@ bool mod_manager::set_default_mods( const t_mod_list &mods )
         json.member( "id", "user:default" );
         json.member( "conflicts", std::vector<std::string>() );
         json.member( "dependencies" );
-        json.write( mods );
+        json.write( default_mods );
         json.member( "//",
                      "Not really obsolete!  Marked as such to prevent it from showing in the main list" );
         json.member( "obsolete", true );
@@ -730,6 +780,8 @@ bool mod_manager::copy_mod_contents( const t_mod_list &mods_to_copy,
         input_files.insert( input_files.end(), lua_files.begin(), lua_files.end() );
         std::sort( input_files.begin(), input_files.end(), []( const cata_path & lhs,
         const cata_path & rhs ) {
+            // File discovery order must be independent of the UI language.
+            // NOLINTNEXTLINE(cata-use-localized-sorting)
             return lhs.generic_u8string() < rhs.generic_u8string();
         } );
         input_files.erase( std::unique( input_files.begin(), input_files.end() ), input_files.end() );
@@ -814,7 +866,9 @@ void mod_manager::save_mods_list( const WORLD *world ) const
     }
     write_to_file( path, [&]( std::ostream & fout ) {
         JsonOut json( fout, true ); // pretty-print
-        json.write( world->active_mod_order );
+        auto mods = world->active_mod_order;
+        canonicalize_mod_list( mods );
+        json.write( mods );
     }, _( "list of mods" ) );
 }
 
@@ -827,7 +881,7 @@ void mod_manager::load_mods_list( WORLD *world ) const
     amo.clear();
     read_from_file_optional_json( get_mods_list_file( world ), [&]( const JsonArray & jsin ) {
         for( const std::string line : jsin ) {
-            const mod_id mod( line );
+            const mod_id mod = canonical_mod_id( mod_id( line ) );
             if( std::find( amo.begin(), amo.end(), mod ) != amo.end() ) {
                 continue;
             }
@@ -842,7 +896,9 @@ bool mod_manager::check_mods_list( WORLD *world ) const
         return true;
     }
     std::vector<mod_id> &amo = world->active_mod_order;
-    bool changed = false;
+    const auto original_mods = amo;
+    canonicalize_mod_list( amo );
+    bool changed = amo != original_mods;
 
     const auto is_virtual_mod = []( const mod_id & mod ) {
         return mod.str().find( '#' ) != std::string::npos;

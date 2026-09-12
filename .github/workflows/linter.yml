@@ -30,6 +30,7 @@ jobs:
         persist-credentials: false
 
     - name: determine changed files
+      id: changed-files
       if: ${{ github.event_name == 'pull_request' }}
       uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
       with:
@@ -46,25 +47,55 @@ jobs:
           for (const path of files) {
             console.log(path);
           }
-          fs.writeFileSync("files_changed", files.join('\n') + '\n');
+          const workflowPath = '.github/workflows/linter.yml';
+          const hasWorkflowChange = files.includes(workflowPath);
+          const hasCpp = hasWorkflowChange || files.some(path =>
+            !path.startsWith('src/third-party/') &&
+            (path === 'Makefile' || path === '.astylerc' || path.endsWith('.c') ||
+              path.endsWith('.cpp') || path.endsWith('.h'))
+          );
+          const hasJson = hasWorkflowChange || files.some(path => path.endsWith('.json'));
+          core.setOutput('has_cpp', hasCpp ? 'true' : 'false');
+          core.setOutput('has_json', hasJson ? 'true' : 'false');
+          fs.writeFileSync("files_changed", files.map(path => `${path}\0`).join(''));
 
-    - run: sudo apt-get install astyle
+    - name: install astyle
+      if: ${{ steps.changed-files.outputs.has_cpp == 'true' }}
+      run: sudo apt-get install astyle
 
-    - run: make -k astyle-fast style-all-json-parallel; git diff --quiet
+    - name: run astyle
+      if: ${{ steps.changed-files.outputs.has_cpp == 'true' }}
+      run: make -k astyle-fast
+
+    - name: run JSON formatter
+      if: ${{ steps.changed-files.outputs.has_json == 'true' }}
+      run: make -k style-all-json-parallel
+
+    - name: check formatting
+      shell: bash
+      run: |
+        status=0
+        while IFS= read -r -d '' path; do
+          if [[ -e "$path" ]] && ! git diff --quiet -- "$path"; then
+            printf 'Formatting changes required: %q\n' "$path"
+            status=1
+          fi
+        done < files_changed
+        exit "$status"
 
     - name: Create pr comment artifacts
       if: ${{ failure() }}
+      shell: bash
       run: |
-        set +e
-        cat files_changed | while read f; do
-          git add $f
-        done
-        git checkout .
-        git reset
-        git diff --exit-code
-        if [ $? -ne 0 ]; then
+        : > formatter_suggestions.diff
+        while IFS= read -r -d '' path; do
+          if [[ -e "$path" ]]; then
+            git diff -U1 -- "$path" >> formatter_suggestions.diff
+          fi
+        done < files_changed
+        if [[ -s formatter_suggestions.diff ]]; then
           mkdir -p suggestions
-          git diff -U1 > suggestions/diff.txt
+          mv formatter_suggestions.diff suggestions/diff.txt
           echo ${{ github.event.pull_request.number }} > suggestions/pr_number
           echo ${{ github.event.pull_request.head.sha }} > suggestions/commit_sha
           echo '[JSON & C++ formatters](https://github.com/CleverRaven/Cataclysm-DDA/blob/master/doc/c++/DEVELOPER_TOOLING.md)' > suggestions/comment.txt

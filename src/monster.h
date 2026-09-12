@@ -24,6 +24,7 @@
 #include "compatibility.h"
 #include "coordinates.h"
 #include "creature.h"
+#include "monster_uid.h"
 #include "type_id.h"
 #include "units_fwd.h"
 #include "value_ptr.h"
@@ -100,6 +101,13 @@ class monster : public Creature
         const monster *as_monster() const override {
             return this;
         }
+
+        const monster_uid &uid() const {
+            return uid_;
+        }
+        void ensure_uid();
+        // Transfer between active and overmap storage without creating a new entity.
+        monster copy_for_persistence() const;
 
         mfaction_id get_monster_faction() const override {
             return faction.id();
@@ -426,6 +434,7 @@ class monster : public Creature
         float get_dodge_base() const override;
 
         float  get_dodge() const override;       // Natural dodge, or 0 if we're occupied
+        int blocks_left = 0; // Remaining blocks
         float  get_melee() const override; // For determining attack skill when awarding dodge practice.
         float  hit_roll() const override;  // For the purposes of comparing to player::dodge_roll()
         float  dodge_roll() const override;  // For the purposes of comparing to player::hit_roll()
@@ -564,6 +573,7 @@ class monster : public Creature
         int morale = 2;
         uint32_t mp_net_id = 0; // MP: network ID for multiplayer monster tracking
     private:
+        monster_uid uid_;
         int amount_eaten = 0;
         void recheck_fed_status();
     public:

@@ -1,5 +1,8 @@
 #include "activity_actor.h"
 
+#include <activity_type.h>
+#include <clone_ptr.h>
+
 #define MP_ENABLED
 #include <algorithm>
 #include <array>
@@ -14,9 +17,9 @@
 #include <list>
 #include <map>
 #include <optional>
-#include <ostream>
 #include <queue>
 #include <set>
+#include <sstream>
 #include <string>
 #include <tuple>
 #include <unordered_set>
@@ -85,6 +88,7 @@
 #include "iuse.h"
 #include "iuse_actor.h"
 #include "json.h"
+#include "json_loader.h"
 #include "lightmap.h"
 #include "line.h"
 #include "magic.h"
@@ -6519,6 +6523,14 @@ void craft_activity_actor::do_turn( player_activity &act, Character &crafter )
             }
 
             if( craft.get_passive_started_at() == calendar::before_time_starts ) {
+                // Unattended steps cannot draw resources from the crafter over time, so consume
+                // the remaining character resource cost before the passive work begins.
+                if( !crafter.craft_consume_character_resources( craft, 10000000 ) ) {
+                    craft.erase_var( "crafter" );
+                    crafter.cancel_activity();
+                    return;
+                }
+
                 craft_stamp_passive_entry( craft, crafter, calendar::turn, craft_item );
                 mode_ = derive_mode();
                 // Back-dated entry can leave alarm and/or ready already due.
@@ -6666,8 +6678,20 @@ void craft_activity_actor::do_turn( player_activity &act, Character &crafter )
             return;
         }
     }
+
+    // Check `character_resources` before charging tools, then apply the validated debit.
+    if( !crafter.craft_consume_character_resources( craft, craft.item_counter, false ) ) {
+        rewind_turn();
+        return;
+    }
+
     // Charge shortfall rewinds the turn before any skill gain.
     if( !crafter.craft_consume_step_tools( craft, &cached_cost_ctx ) ) {
+        rewind_turn();
+        return;
+    }
+
+    if( !crafter.craft_consume_character_resources( craft, craft.item_counter ) ) {
         rewind_turn();
         return;
     }
@@ -7388,12 +7412,9 @@ void plant_seed_activity_actor::finish( player_activity &act, Character &who )
             const std::map<std::string, double> num_ctx = {
                 { "actor_is_npc", who.is_npc() ? 1.0 : 0.0 }
             };
-            if( new_furn.plant ) {
-                iexamine::run_plant_eocs( new_furn.plant->eoc_on_plant, who, here, examp, *planted_seed,
-                                          seed_stage, seed_stage, {}, num_ctx );
-            }
-            iexamine::run_plant_eocs( planted_seed->type->seed->eoc_on_plant, who, here, examp,
-                                      *planted_seed, seed_stage, seed_stage, {}, num_ctx );
+            iexamine::run_plant_lifecycle_event(
+                "plant", who, here, examp, *planted_seed,
+                seed_stage, seed_stage, {}, num_ctx );
         }
 
         who.add_msg_player_or_npc( _( "You plant some %s." ), _( "<npcname> plants some %s." ),
@@ -10609,12 +10630,9 @@ void fertilize_plant_activity_actor::finish( player_activity &act, Character &wh
             { "reduction_turns", static_cast<double>( to_turns<int>( reduction ) ) },
             { "actor_is_npc", who.is_npc() ? 1.0 : 0.0 }
         };
-        if( furn.plant ) {
-            iexamine::run_plant_eocs( furn.plant->eoc_on_fertilize, who, here, plant_position,
-                                      *fertilized_seed, stage, stage, string_ctx, num_ctx );
-        }
-        iexamine::run_plant_eocs( fertilized_seed->type->seed->eoc_on_fertilize, who, here, plant_position,
-                                  *fertilized_seed, stage, stage, string_ctx, num_ctx );
+        iexamine::run_plant_lifecycle_event(
+            "fertilize", who, here, plant_position, *fertilized_seed,
+            stage, stage, string_ctx, num_ctx );
     }
 
     //~ %1$s: plant name, %2$s: fertilizer name
@@ -11155,7 +11173,7 @@ void mend_item_activity_actor::finish( player_activity &act, Character &who )
     const fault_fix &fix = *mending_method;
     const requirement_data &reqs = fix.get_requirements();
     const inventory &inv = who.crafting_inventory();
-    if( !reqs.can_make_with_inventory( inv, is_crafting_component ) ) {
+    if( !reqs.can_make_with_inventory( &who, inv, is_crafting_component ) ) {
         add_msg( m_info, _( "You are currently unable to mend the %s." ), target.tname() );
         return;
     }
@@ -11174,7 +11192,7 @@ void mend_item_activity_actor::finish( player_activity &act, Character &who )
         }
     }
     for( const ::fault_id &id : fix.faults_added ) {
-        target.set_fault( id, true, nullptr );
+        target.set_fault( id, true, nullptr, true );
     }
     for( const auto& [var_name, var_value] : fix.set_variables ) {
         target.set_var( var_name, var_value );
@@ -11257,7 +11275,7 @@ void fix_wound_activity_actor::finish( player_activity &act, Character &who )
     const wound_fix &fix = *mending_method;
     const requirement_data &reqs = fix.get_requirements();
     const inventory &inv = who.crafting_inventory();
-    if( !reqs.can_make_with_inventory( inv, is_crafting_component ) ) {
+    if( !reqs.can_make_with_inventory( &who, inv, is_crafting_component ) ) {
         add_msg( m_info, _( "You are currently unable to heal the %s." ), healed_bp->name.translated() );
         return;
     }
@@ -11828,10 +11846,14 @@ void unload_loot_activity_actor::stage_do( player_activity &, Character &you )
 
         const std::unordered_set<tripoint_abs_ms> dest_set;
 
-        zone_sorting::unload_item( you, src,
-                                   zone_unload_options,
-                                   it->second ? zone_sorting::cargo_part_from_index( src_bub, *it->second ) : std::nullopt,
-                                   it->first, dest_set, num_processed );
+        if( !zone_sorting::unload_item( you, src,
+                                        zone_unload_options,
+                                        it->second ? zone_sorting::cargo_part_from_index( src_bub, *it->second ) : std::nullopt,
+                                        it->first, dest_set, num_processed ) ) {
+            // Starting gunmod removal replaces this actor.  Resume from the
+            // saved zone activity instead of continuing through destroyed state.
+            return;
+        }
 
         if( you.get_moves() <= 0 ) {
             return;
@@ -11926,7 +11948,8 @@ void vehicle_activity_actor::complete_vehicle( player_activity &act, Character &
         case VEHICLE_INSTALL: {
             const inventory &inv = you.crafting_inventory();
             const requirement_data reqs = vpinfo.install_requirements();
-            if( !reqs.can_make_with_inventory( inv, is_crafting_component, 1, craft_flags::none, false ) ) {
+            if( !reqs.can_make_with_inventory( &you, inv, is_crafting_component, 1, craft_flags::none,
+                                               false ) ) {
                 you.add_msg_player_or_npc( m_info,
                                            _( "You don't meet the requirements to install the %s." ),
                                            _( "<npcname> doesn't meet the requirements to install the %s." ),
@@ -12081,7 +12104,7 @@ void vehicle_activity_actor::complete_vehicle( player_activity &act, Character &
             const bool smash_remove = vpi.has_flag( "SMASH_REMOVE" );
             const inventory &inv = you.crafting_inventory();
             const requirement_data &reqs = vpi.removal_requirements();
-            if( !reqs.can_make_with_inventory( inv, is_crafting_component ) ) {
+            if( !reqs.can_make_with_inventory( &you, inv, is_crafting_component ) ) {
                 //~  1$s is the vehicle part name
                 add_msg( m_info, _( "You don't meet the requirements to remove the %1$s." ), vpi.name() );
                 break;
@@ -12711,8 +12734,43 @@ void heat_activity_actor::finish( player_activity &act, Character &p )
 {
     map &here = get_map();
 
-    for( drop_location &ait : to_heat ) {
+    // Liquid handling may assign ACT_CONSUME and destroy this actor. Retire
+    // heating before that handoff and keep its remaining work on the stack.
+    const drop_locations heating_targets = to_heat;
+    heater heat_source = heater_data;
+    const heating_requirements heating_cost = requirements;
+    act.set_to_null();
+
+    for( const drop_location &target : heating_targets ) {
+        if( !target.first ) {
+            p.add_msg_if_player( _( "Some of the food you selected is gone." ) );
+            return;
+        }
+    }
+
+    if( heat_source.consume_flag ) {
+        if( heat_source.pseudo_flag ) {
+            const optional_vpart_position vp = here.veh_at( heat_source.vpt );
+            if( !vp ) {
+                p.add_msg_if_player( _( "You can't find the appliance any more." ) );
+                return;
+            }
+            vp->vehicle().discharge_battery( here, heating_cost.ammo * heat_source.heating_effect );
+        } else {
+            if( !heat_source.loc ) {
+                p.add_msg_if_player( _( "You can't find the heater any more." ) );
+                return;
+            }
+            heat_source.loc->activation_consume( heating_cost.ammo, heat_source.loc.pos_bub( here ), &p );
+        }
+    }
+
+    for( const drop_location &ait : heating_targets ) {
         item_location cold_item = ait.first;
+        if( !cold_item ) {
+            p.add_msg_if_player( _( "Some of the food you selected is gone." ) );
+            continue;
+        }
         if( cold_item->count_by_charges() ) {
             item copy( *cold_item );
             copy.charges = ait.second;
@@ -12736,19 +12794,9 @@ void heat_activity_actor::finish( player_activity &act, Character &p )
             }
         }
     }
-    if( heater_data.consume_flag ) {
-        if( heater_data.pseudo_flag ) {
-            here.veh_at( heater_data.vpt ).value().vehicle().discharge_battery( here, requirements.ammo *
-                    heater_data.heating_effect );
-        } else {
-            heater_data.loc->activation_consume( requirements.ammo, heater_data.loc.pos_bub( here ), &p );
-        }
-    }
     p.add_msg_if_player( m_good, _( "You heated your items." ) );
 
     p.invalidate_crafting_inventory();
-
-    act.set_to_null();
 }
 
 void heat_activity_actor::serialize( JsonOut &jsout ) const
@@ -13831,7 +13879,8 @@ void butchery_activity_actor::calculate_butchery_data( Character &you, butchery_
     const mtype &corpse = *target.get_item()->get_mtype();
 
     std::pair<float, requirement_id> butchery_reqs =
-        corpse.harvest->get_butchery_requirements().get_fastest_requirements( you.crafting_inventory(),
+        corpse.harvest->get_butchery_requirements().get_fastest_requirements( &you,
+                you.crafting_inventory(),
                 corpse.size, this_bd.b_type );
     this_bd.req_speed_bonus = butchery_reqs.first;
     this_bd.req = butchery_reqs.second;
@@ -14337,45 +14386,109 @@ void vehicle_part_install_service_activity_actor::start( player_activity &act, C
     act.index = mechanic_id.get_value();
 }
 
+bool vehicle_part_install_service_activity_actor::can_install_order( map &here,
+        const vehicle &target, const vpart_id &part_id,
+        const std::vector<vehicle_part_install_service_entry> &entries )
+{
+    if( !part_id.is_valid() || entries.empty() ) {
+        return false;
+    }
+    if( entries.size() == 1 ) {
+        const vehicle_part_install_service_entry &entry = entries.front();
+        return !entry.reserved_part.is_null() &&
+               entry.reserved_part.typeId() == part_id->base_item &&
+               !veh_interact::service_installation_position_denial( here, target, entry.mount,
+                       part_id.obj() ) &&
+               !veh_interact::service_installation_denial( target, entry.mount, part_id.obj() );
+    }
+
+    std::vector<vehicle_part> preview_parts;
+    for( const vpart_reference &part : target.get_all_parts() ) {
+        if( !part.part().removed && !part.part().is_fake ) {
+            preview_parts.push_back( part.part() );
+        }
+    }
+    std::ostringstream buffer;
+    JsonOut jsout( buffer );
+    jsout.write( preview_parts );
+    vehicle preview{ vproto_id() };
+    preview.deserialize_parts( json_loader::from_string( buffer.str() ).get_array() );
+    preview.refresh();
+    // Validation must not play engine startup sounds when a smart controller is enabled.
+    preview.engine_on = true;
+    // Installing on a preview can remove fake parts from map caches.  Keep those
+    // changes on a separate unloaded map, away from the customer's vehicle.
+    tinymap preview_map;
+    for( const vehicle_part_install_service_entry &entry : entries ) {
+        if( entry.reserved_part.is_null() || entry.reserved_part.typeId() != part_id->base_item ) {
+            return false;
+        }
+        if( veh_interact::service_installation_position_denial( here, target, entry.mount,
+                part_id.obj() ) ) {
+            return false;
+        }
+        if( veh_interact::service_installation_denial( preview, entry.mount, part_id.obj() ) ) {
+            return false;
+        }
+        if( preview.install_part( *preview_map.cast_to_map(), entry.mount, part_id,
+                                  item( entry.reserved_part ) ) < 0 ) {
+            return false;
+        }
+    }
+    return true;
+}
+
 void vehicle_part_install_service_activity_actor::settle_failed_order( Character &who,
         const std::string &status )
 {
+    if( settled ) {
+        return;
+    }
+    settled = true;
     npc *mechanic = g->find_npc( mechanic_id );
-    if( mechanic != nullptr ) {
-        if( paid_cost > 0 ) {
-            mechanic->op_of_u.owed += paid_cost;
-        }
-        if( !reserved_part.is_null() ) {
-            if( supplied_by_mechanic ) {
-                reserved_part.set_owner( *mechanic );
-                bool returned_to_shop = false;
-                if( mechanic->is_shopkeeper() ) {
-                    zone_manager &zones = zone_manager::get_manager();
-                    const std::unordered_set<tripoint_bub_ms> shop_tiles =
-                        zones.get_point_set_loot( mechanic->pos_abs(), pickup_range,
-                                                  mechanic->get_fac_id() );
-                    if( !shop_tiles.empty() ) {
-                        get_map().add_item_or_charges( *shop_tiles.begin(), reserved_part );
-                        returned_to_shop = true;
-                    }
-                }
-                if( !returned_to_shop ) {
-                    mechanic->i_add( reserved_part );
-                }
-            } else {
-                who.i_add_or_drop( reserved_part );
+    for( vehicle_part_install_service_entry &entry : entries ) {
+        if( mechanic != nullptr ) {
+            if( entry.paid_cost > 0 ) {
+                mechanic->op_of_u.owed += entry.paid_cost;
             }
+            if( !entry.reserved_part.is_null() ) {
+                if( entry.supplied_by_mechanic ) {
+                    entry.reserved_part.set_owner( *mechanic );
+                    bool returned_to_shop = false;
+                    if( mechanic->is_shopkeeper() ) {
+                        zone_manager &zones = zone_manager::get_manager();
+                        const std::unordered_set<tripoint_bub_ms> shop_tiles =
+                            zones.get_point_set_loot( mechanic->pos_abs(), pickup_range,
+                                                      mechanic->get_fac_id() );
+                        if( !shop_tiles.empty() ) {
+                            get_map().add_item_or_charges( *shop_tiles.begin(), entry.reserved_part );
+                            returned_to_shop = true;
+                        }
+                    }
+                    if( !returned_to_shop ) {
+                        mechanic->i_add( entry.reserved_part );
+                    }
+                } else {
+                    who.i_add_or_drop( entry.reserved_part );
+                }
+            }
+        } else if( !entry.reserved_part.is_null() ) {
+            who.i_add_or_drop( entry.reserved_part );
         }
+    }
+    entries.clear();
+    if( mechanic != nullptr ) {
         mechanic->set_value( "vehicle_part_service_status", status );
         mechanic->remove_effect( effect_currently_busy );
-    } else if( !reserved_part.is_null() ) {
-        who.i_add_or_drop( reserved_part );
     }
-    reserved_part = item();
 }
 
 void vehicle_part_install_service_activity_actor::finish( player_activity &act, Character &who )
 {
+    if( settled ) {
+        act.set_to_null();
+        return;
+    }
     map &here = get_map();
     const optional_vpart_position ovp = here.veh_at( vehicle_pos );
     vehicle *target = ovp ? &ovp->vehicle() : nullptr;
@@ -14386,13 +14499,7 @@ void vehicle_part_install_service_activity_actor::finish( player_activity &act, 
                               target->is_owned_by( get_avatar() ) &&
                               !target->player_in_control( here, get_avatar() ) &&
                               talk_function::vehicle_service_state_snapshot( *target ) == vehicle_snapshot;
-    const bool valid_part = part_id.is_valid() && !reserved_part.is_null() &&
-                            reserved_part.typeId() == part_id->base_item;
-    const std::optional<std::string> denial = valid_target && valid_part ?
-            veh_interact::service_installation_denial( *target, mount, part_id.obj() ) :
-            std::optional<std::string>( _( "The installation order is no longer valid." ) );
-
-    if( !valid_target || !valid_part || denial ) {
+    if( !valid_target || !can_install_order( here, *target, part_id, entries ) ) {
         settle_failed_order( who, "invalidated" );
         who.add_msg_if_player( m_bad,
                                _( "The vehicle changed while the installation was underway.  "
@@ -14401,21 +14508,36 @@ void vehicle_part_install_service_activity_actor::finish( player_activity &act, 
         return;
     }
 
-    vehicle_part installed( part_id, item( reserved_part ) );
-    if( part_id->variants.count( variant ) > 0 ) {
-        installed.variant = variant;
-    }
-    installed.direction = units::from_degrees( direction_degrees );
-    const int installed_index = target->install_part( here, mount, std::move( installed ) );
-    if( installed_index < 0 ) {
-        settle_failed_order( who, "invalidated" );
-        who.add_msg_if_player( m_bad,
-                               _( "The vehicle part could not be installed.  The order was fully credited." ) );
-        act.set_to_null();
-        return;
+    // Track installed parts even after the complete order passed validation.
+    // A failed install must never leave installed copies of refunded components.
+    std::vector<int> installed_indices;
+    const bool original_engine_on = target->engine_on;
+    for( const vehicle_part_install_service_entry &entry : entries ) {
+        vehicle_part installed( part_id, item( entry.reserved_part ) );
+        if( part_id->variants.count( variant ) > 0 ) {
+            installed.variant = variant;
+        }
+        installed.direction = units::from_degrees( direction_degrees );
+        const int index = target->install_part( here, entry.mount, std::move( installed ) );
+        if( index < 0 ) {
+            for( const int installed_index : installed_indices ) {
+                target->part( installed_index ).removed = true;
+            }
+            target->part_removal_cleanup( here );
+            target->engine_on = original_engine_on;
+            target->recalculate_enchantment_cache();
+            settle_failed_order( who, "invalidated" );
+            who.add_msg_if_player( m_bad,
+                                   _( "The vehicle parts could not be installed.  The order was fully credited." ) );
+            act.set_to_null();
+            return;
+        }
+        installed_indices.push_back( index );
     }
 
-    reserved_part = item();
+    const int installed_count = entries.size();
+    entries.clear();
+    settled = true;
     if( disable_flyable ) {
         target->set_flyable( false );
     }
@@ -14423,17 +14545,21 @@ void vehicle_part_install_service_activity_actor::finish( player_activity &act, 
     if( npc *mechanic = g->find_npc( mechanic_id ) ) {
         mechanic->set_value( "vehicle_part_service_status", "complete" );
         mechanic->remove_effect( effect_currently_busy );
-        who.add_msg_if_player( m_good, _( "%1$s installs the %2$s into the %3$s." ),
-                               mechanic->get_name(), target->part( installed_index ).name(), target->name );
+        who.add_msg_if_player( m_good,
+                               _( "%1$s installs %2$d × %3$s into the %4$s." ),
+                               mechanic->get_name(), installed_count, part_id->name(), target->name );
     } else {
-        who.add_msg_if_player( m_good, _( "The %1$s is installed into the %2$s." ),
-                               target->part( installed_index ).name(), target->name );
+        who.add_msg_if_player( m_good, _( "%1$d × %2$s installed into the %3$s." ),
+                               installed_count, part_id->name(), target->name );
     }
     act.set_to_null();
 }
 
 void vehicle_part_install_service_activity_actor::canceled( player_activity &, Character &who )
 {
+    if( settled ) {
+        return;
+    }
     settle_failed_order( who, "cancelled" );
     who.add_msg_if_player( m_info,
                            _( "The vehicle installation is canceled and the order is fully credited." ) );
@@ -14446,14 +14572,22 @@ void vehicle_part_install_service_activity_actor::serialize( JsonOut &jsout ) co
     jsout.member( "install_time", initial_wait_time );
     jsout.member( "vehicle_pos", vehicle_pos );
     jsout.member( "vehicle_snapshot", vehicle_snapshot );
-    jsout.member( "mount", mount );
     jsout.member( "part_id", part_id );
-    jsout.member( "reserved_part", reserved_part );
-    jsout.member( "supplied_by_mechanic", supplied_by_mechanic );
-    jsout.member( "paid_cost", paid_cost );
+    jsout.member( "entries" );
+    jsout.start_array();
+    for( const vehicle_part_install_service_entry &entry : entries ) {
+        jsout.start_object();
+        jsout.member( "mount", entry.mount );
+        jsout.member( "reserved_part", entry.reserved_part );
+        jsout.member( "supplied_by_mechanic", entry.supplied_by_mechanic );
+        jsout.member( "paid_cost", entry.paid_cost );
+        jsout.end_object();
+    }
+    jsout.end_array();
     jsout.member( "variant", variant );
     jsout.member( "direction_degrees", direction_degrees );
     jsout.member( "disable_flyable", disable_flyable );
+    jsout.member( "settled", settled );
     jsout.end_object();
 }
 
@@ -14466,14 +14600,27 @@ std::unique_ptr<activity_actor> vehicle_part_install_service_activity_actor::des
     data.read( "install_time", actor.initial_wait_time );
     data.read( "vehicle_pos", actor.vehicle_pos );
     data.read( "vehicle_snapshot", actor.vehicle_snapshot );
-    data.read( "mount", actor.mount );
     data.read( "part_id", actor.part_id );
-    data.read( "reserved_part", actor.reserved_part );
-    data.read( "supplied_by_mechanic", actor.supplied_by_mechanic );
-    data.read( "paid_cost", actor.paid_cost );
+    const auto read_entry = [&actor]( const JsonObject & entry_data ) {
+        vehicle_part_install_service_entry entry;
+        entry_data.read( "mount", entry.mount );
+        entry_data.read( "reserved_part", entry.reserved_part );
+        entry_data.read( "supplied_by_mechanic", entry.supplied_by_mechanic );
+        entry_data.read( "paid_cost", entry.paid_cost );
+        actor.entries.push_back( std::move( entry ) );
+    };
+    if( data.has_array( "entries" ) ) {
+        for( const JsonObject entry : data.get_array( "entries" ) ) {
+            read_entry( entry );
+        }
+    } else {
+        // Old saves contain one reserved part at the top level.
+        read_entry( data );
+    }
     data.read( "variant", actor.variant );
     data.read( "direction_degrees", actor.direction_degrees );
     data.read( "disable_flyable", actor.disable_flyable );
+    data.read( "settled", actor.settled );
     return actor.clone();
 }
 

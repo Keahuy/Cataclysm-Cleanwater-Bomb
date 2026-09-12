@@ -86,6 +86,7 @@
 - Some flags (items, effects, vehicle parts, construction pre_flags) have to be defined in `flags.json` or `vp_flags.json` (with type: `json_flag`) to work correctly.
 - Many of the flags intended for one category or item type can be used in other categories or item types.  Experiment to see where else flags can be used.
 - Offensive and defensive flags can be used on any item type that can be wielded.
+- Fault chance modifiers from `UNBREAKABLE`, `UNBREAKABLE_MELEE`, `STURDY`, `DURABLE`, and `DURABLE_MELEE` do not stack; when several apply, the strongest reduction wins.
 
 
 ## Inheritance
@@ -263,7 +264,7 @@ Some armor flags, such as `WATCH` and `ALARMCLOCK` are compatible with other ite
 - ```STAR_PLATE``` Item can be worn with ryūsei battle kit armor; specifically can be put in pocket for armor with this flag restriction.
 - ```STAR_SHOULDER``` Item can be worn with ryūsei battle kit armor ; specifically can be put in pocket for armor with this flag restriction.
 - ```STAR_SKIRT``` Item can be worn with ryūsei battle kit armor; specifically can be put in pocket for armor with this flag restriction.
-- ```STURDY``` This clothing is a lot more resistant to damage than normal.
+- ```STURDY``` This clothing is a lot more resistant to damage than normal.  Fault chance is halved.
 - ```SUN_GLASSES``` Prevents glaring when in sunlight.
 - ```SWIM_GOGGLES``` Allows you to see much further underwater.
 - ```THERMOMETER``` This gear is equipped with an accurate thermometer (which is used to measure temperature).
@@ -384,9 +385,11 @@ Character flags can be `trait_id`, `json_flag_id` or `flag_id`.  Some of these a
 - ```CANNIBAL``` Butcher humans, eat foods with the `CANNIBALISM` and `STRICT_HUMANITARIANISM` flags without a morale penalty.
 - ```CANNOT_ATTACK``` A creature with this flag cannot attack (includes spellcasting).
 - ```CANNOT_CHANGE_TEMPERATURE``` A creature with this flag cannot change body temperature.
+- ```CANNOT_CONSUME_DRUGS``` A creature with this flag cannot use items with the `consume_drug` use_action.
 - ```CANNOT_GAIN_EFFECTS``` A creature with this effect flag cannot gain effects.
 - ```CANNOT_GAIN_WEARINESS``` A character with this flag always has Fresh weariness. Weariness is still tracked in the background and accurately set when the flag wears off.
 - ```CANNOT_MOVE``` A creature with this flag cannot move.
+- ```CANNOT_SLEEP``` A character with this flag cannot sleep. It does not prevent any of the negative effects of extreme tiredness.
 - ```CANNOT_TAKE_DAMAGE``` A creature with this flag cannot take any damage.
 - ```CANNOT_USE_COMPUTERS``` A creature with this flag cannot activate a computer terminal or use various computer functions (e.g. saving ebooks or reading efiles).
 - ```CBQ_LEARN_BONUS``` You learn CBQ from the bionic bio_cqb faster.
@@ -541,10 +544,9 @@ These branches are the valid `dreams` from [dreams.json](/data/json/dreams.json)
 
 ## Comestibles
 
+Drunkenness, caffeine and nicotine are no longer flag-driven: items deliver the `ethanol`, `caffeine` and `nicotine` vitamins, and their excess levels trigger the `drunk`, `caffeine_eff` and `cig` effects.  See VITAMIN.md.
+
 - ```ACID``` When consumed using the `BLECH` function, penalties are reduced if character has `ACIDPROOF` or `ACIDBLOOD` traits.
-- ```ALCOHOL``` Increases drunkenness.  Adds effect `drunk`.
-- ```ALCOHOL_STRONG``` Greatly increases drunkenness.  Adds effect `drunk`.
-- ```ALCOHOL_WEAK``` Slightly increases drunkenness.  Adds effect `drunk`.
 - ```CARNIVORE_OK``` Can be eaten by characters with the Carnivore mutation at 50% kcal reduction.
 - ```CANT_HEAL_EVERYONE``` This med can't be used by everyone, it requires a special mutation.  See `can_heal_with` in mutation.
 - ```CORROSIVE``` when consumed using the `BLECH` function, causes the same penalties as `ACID` but is not affected by `ACIDPROOF` or `ACIDBLOOD` traits.
@@ -606,7 +608,6 @@ These flags apply to the `use_action` field, instead of the `flags` field.
 - ```BLECH``` Causes vomiting, adds disease `poison`, adds pain and hurts torso.
 - ```BLECH_BECAUSE_UNCLEAN``` Causes warning.
 - ```CHEW``` Displays message "You chew your %s.", but otherwise does nothing.
-- ```CIG``` Alleviates nicotine cravings.  Adds disease `cig`.
 - ```COKE``` Decreases hunger.  Adds disease `high`.
 - ```CRACK``` Decreases hunger.  Adds disease `high`.
 - ```DISINFECTANT``` Prevents infections.
@@ -857,7 +858,8 @@ These flags can be applied via JSON item definition to most items.  Not to be co
 - ```DISCOUNT_VALUE_2``` This item gives an average discount for fuel, bought in automated gas console.
 - ```DISCOUNT_VALUE_3``` This item gives a big discount for fuel, bought in automated gas console.
 - ```DROP_ACTION_ONLY_IF_LIQUID``` Cause `drop_action` only if item in liquid phase.
-- ```DURABLE_MELEE``` Item is made to hit stuff and it does it well, so it's considered to be a lot tougher than other weapons made of the same materials.
+- ```DURABLE``` Item takes only a quarter of the damage it would otherwise receive, from any source.  Fault chance is halved.
+- ```DURABLE_MELEE``` Item is made to hit stuff and it does it well, so it's considered to be a lot tougher than other weapons made of the same materials.  Fault chance is halved.
 - ```E_COPIABLE``` This item can be scanned onto an electronic device and can be electronically copied.
 - ```E_FILE_COLLECTION``` This item represents a combinable collection of files. Does not imply E_COPIABLE.
 - ```E_STORABLE``` This item can be stored on an in-game electronic device.
@@ -973,8 +975,8 @@ These flags can be applied via JSON item definition to most items.  Not to be co
 - ```TRADER_KEEP_EQUIPPED``` NPCs will only trade this item if they aren't currently wearing or wielding it.
 - ```TRADER_KEEP``` NPCs will not trade this item away under any circumstances.
 - ```TWO_WAY_RADIO``` this items is two-way radio, and work accordingly.
-- ```UNBREAKABLE_MELEE``` Never gets damaged when used as melee weapon.
-- ```UNBREAKABLE``` This item can not be damaged, be that directly, while worn as armor, or when used as a melee weapon.
+- ```UNBREAKABLE_MELEE``` Never gets damaged when used as melee weapon.  Fault chance is reduced to a quarter of normal.
+- ```UNBREAKABLE``` This item can not be damaged, be that directly, while worn as armor, or when used as a melee weapon.  Fault chance is reduced to a quarter of normal.
 - ```UNRECOVERABLE``` Cannot be recovered from a disassembly.
 - ```USE_POWER_WHEN_HIT``` This armor consume energy when you got hit, equal to damage that was dealt (energy consuming happen before the armor mitigation).
 - ```VIEW_PHOTOS``` This item can display held photos.
@@ -1183,7 +1185,7 @@ Used to describe monster characteristics and set their properties and abilities.
 - ```CAN_BE_CULLED``` This animal can be culled if it's a pet.
 - ```CAN_DIG``` Will dig on any diggable terrain the same way `DIGS` does, however, will walk normally over non-diggable terrain.
 - ```CAN_OPEN_DOORS``` Can open doors on its path.
-- ```CLIMBS``` (depricated in favor of [moveskills](MONSTERS.md#move_skills)) Can climb over fences or similar obstacles quickly.
+- ```CLIMBS``` (deprecated in favor of [moveskills](MONSTERS.md#move_skills)) Can climb over fences or similar obstacles quickly.
 - ```CLUMSY_ATTACKS``` Has a 1 in 4 chance of falling over when missing an attack.
 - ```COLDPROOF``` Immune to cold damage.
 - ```COMBAT_MOUNT```  This mount has better chance to ignore hostile monster fear.
@@ -1288,7 +1290,7 @@ Used to describe monster characteristics and set their properties and abilities.
 - ```STUN_IMMUNE``` This monster is immune to stun.
 - ```SUNDEATH``` Dies in full sunlight.
 - ```SWARMS``` Groups together and forms loose packs.
-- ```SWIMS``` (depricated in favor of [moveskills](MONSTERS.md#move_skills)) Treats water as 50 movement point terrain.
+- ```SWIMS``` (deprecated in favor of [moveskills](MONSTERS.md#move_skills)) Treats water as 50 movement point terrain.
 - ```TRUESIGHT``` The monster can see creatures normally even if they have the `CAMOUFLAGE`, `INVISIBLE` or `NIGHT_INVISIBILITY` flags
 - ```UNREAKABLE_MORALE``` The monster will never run from combat once engaged
 - ```VAMP_VIRUS``` This monster can inflict the `vampire_virus` effect.  Used by Xedra Evolved mod.

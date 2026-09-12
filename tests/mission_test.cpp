@@ -1,13 +1,18 @@
 #include <functional>
 #include <memory>
+#include <sstream>
+#include <string>
 #include <vector>
 
 #include "avatar.h"
 #include "cata_catch.h"
 #include "character_id.h"
 #include "coordinates.h"
+#include "flexbuffer_json.h"
 #include "game.h"
 #include "item.h"
+#include "json.h"
+#include "json_loader.h"
 #include "map.h"
 #include "map_helpers.h"
 #include "mission.h"
@@ -17,12 +22,46 @@
 
 static const itype_id itype_test_rock( "test_rock" );
 
+static const mission_type_id mission_TEST_MISSION_FIND_ITEM( "TEST_MISSION_FIND_ITEM" );
+static const mission_type_id mission_TEST_MISSION_GENERIC_REWARD( "TEST_MISSION_GENERIC_REWARD" );
 static const mission_type_id mission_TEST_MISSION_GOAL_CONDITION1( "TEST_MISSION_GOAL_CONDITION1" );
 static const mission_type_id mission_TEST_MISSION_GOAL_CONDITION2( "TEST_MISSION_GOAL_CONDITION2" );
 
 static const morale_type morale_feeling_good( "morale_feeling_good" );
 
 static const npc_template_id npc_template_test_talker( "test_talker" );
+
+TEST_CASE( "mission_generic_reward_claim_persists_across_copy_and_save",
+           "[mission][serialization]" )
+{
+    mission::clear_all();
+    mission *original = mission::reserve_new(
+                            mission_TEST_MISSION_GENERIC_REWARD, character_id() );
+    REQUIRE( original != nullptr );
+    CHECK_FALSE( original->generic_reward_claimed() );
+
+    original->commit_generic_reward_claim();
+    CHECK( original->generic_reward_claimed() );
+    const mission copied = *original;
+    CHECK( copied.generic_reward_claimed() );
+
+    std::ostringstream serialized;
+    JsonOut json( serialized );
+    original->serialize( json );
+    JsonObject saved = json_loader::from_string( serialized.str() );
+    mission loaded;
+    loaded.deserialize( saved );
+    CHECK( loaded.generic_reward_claimed() );
+
+    JsonObject legacy = json_loader::from_string(
+                            R"({
+  "type_id": "TEST_MISSION_GENERIC_REWARD",
+  "target": [ 0, 0, 0 ]
+})" );
+    loaded.deserialize( legacy );
+    CHECK_FALSE( loaded.generic_reward_claimed() );
+    mission::clear_all();
+}
 
 TEST_CASE( "mission_goal_condition_test", "[mission]" )
 {
@@ -189,4 +228,78 @@ TEST_CASE( "mission_goal_condition_test", "[mission]" )
             }
         }
     }
+}
+
+namespace
+{
+
+mission *assign_test_find_item_mission( avatar &dude )
+{
+    mission *m = mission::reserve_new( mission_TEST_MISSION_FIND_ITEM, character_id() );
+    if( m->get_assigned_player_id() == dude.getID() ) {
+        m->set_assigned_player_id( character_id( -2 ) );
+    }
+    m->assign( dude );
+    return m;
+}
+
+} // namespace
+
+TEST_CASE( "automatic_find_item_mission_batch_processing", "[mission]" )
+{
+    avatar &dude = get_avatar();
+    map &here = get_map();
+    clear_character( dude, true );
+    clear_map();
+    dude.reset_all_missions();
+    mission::clear_all();
+
+    SECTION( "missing item does not complete the mission" ) {
+        const mission *m = assign_test_find_item_mission( dude );
+        mission::process_all();
+        CHECK( m->in_progress() );
+    }
+
+    SECTION( "item in character inventory completes the mission" ) {
+        const mission *m = assign_test_find_item_mission( dude );
+        item rock( itype_test_rock );
+        dude.wield( rock );
+        mission::process_all();
+        CHECK_FALSE( m->in_progress() );
+    }
+
+    SECTION( "nearby item completes the mission" ) {
+        const mission *m = assign_test_find_item_mission( dude );
+        here.add_item( dude.pos_bub() + tripoint_rel_ms::east, item( itype_test_rock ) );
+        mission::process_all();
+        CHECK_FALSE( m->in_progress() );
+    }
+
+    SECTION( "one item cannot complete two missions" ) {
+        const mission *first = assign_test_find_item_mission( dude );
+        const mission *second = assign_test_find_item_mission( dude );
+        item rock( itype_test_rock );
+        dude.wield( rock );
+        mission::process_all();
+        CHECK( first->in_progress() != second->in_progress() );
+    }
+}
+
+TEST_CASE( "automatic_find_item_mission_batch_performance", "[.][performance][mission]" )
+{
+    avatar &dude = get_avatar();
+    clear_character( dude, true );
+    clear_map();
+    dude.reset_all_missions();
+    mission::clear_all();
+
+    for( int i = 0; i < 100; ++i ) {
+        assign_test_find_item_mission( dude );
+    }
+
+    BENCHMARK( "missing find-item mission" ) {
+        mission::process_all();
+    };
+
+    SUCCEED();
 }

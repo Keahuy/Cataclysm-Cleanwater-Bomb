@@ -2027,6 +2027,16 @@ void cata_tiles::reset_minimap()
     minimap->reset();
 }
 
+void cata_tiles::reset_character_preview()
+{
+    char_preview_work_tex.reset();
+    char_preview_tex.reset();
+    char_preview_work_w = 0;
+    char_preview_work_h = 0;
+    char_preview_w = 0;
+    char_preview_h = 0;
+}
+
 void cata_tiles::reset_tint_mask()
 {
     tint_mask_tex.reset();
@@ -4515,8 +4525,23 @@ bool cata_tiles::draw_vpart( const tripoint_bub_ms &p, lit_level ll, int &height
     return false;
 }
 
+SDL_Rect cata_tiles::vehicle_preview_selection_rect( const point_rel_ms &first,
+        const point_rel_ms &second, const point_rel_ms &cursor_vp_mount,
+        const point &center_px, const point &tile_size )
+{
+    const point_rel_ms first_tile = ( first + cursor_vp_mount ).rotate( 3 );
+    const point_rel_ms second_tile = ( second + cursor_vp_mount ).rotate( 3 );
+    const int left = std::min( first_tile.x(), second_tile.x() );
+    const int top = std::min( first_tile.y(), second_tile.y() );
+    const int right = std::max( first_tile.x(), second_tile.x() );
+    const int bottom = std::max( first_tile.y(), second_tile.y() );
+    return SDL_Rect{ center_px.x + left * tile_size.x, center_px.y + top * tile_size.y,
+                     ( right - left + 1 ) *tile_size.x, ( bottom - top + 1 ) *tile_size.y };
+}
+
 bool cata_tiles::draw_vehicle_preview( const catacurses::window &w_disp, const vehicle &veh,
-                                       const point_rel_ms &cursor_vp_mount, int &cpart )
+                                       const point_rel_ms &cursor_vp_mount, int &cpart,
+                                       const std::optional<std::pair<point_rel_ms, point_rel_ms>> &selection )
 {
     // Reuses the normal map sprite path (draw_from_id_string, exactly as draw_vpart does) to
     // render the vehicle into an arbitrary curses window, without modifying the core renderer.
@@ -4532,7 +4557,13 @@ bool cata_tiles::draw_vehicle_preview( const catacurses::window &w_disp, const v
     // This temporarily rescales the shared tile context. cata_tiles::draw() does not reset
     // the scale every frame, so we must restore it before returning or the map would stay
     // at the preview scale.
+    restore_on_out_of_scope restore_origin( o );
+    restore_on_out_of_scope restore_pixel_origin( op );
+    restore_on_out_of_scope restore_entity_offset( m_entity_draw_offset );
     const int saved_zoom = g->get_zoom();
+    on_out_of_scope restore_scale( [this, saved_zoom]() {
+        set_draw_scale( saved_zoom );
+    } );
     // Fixed preview scale (16 == native tile size). Lower it to fit more of large vehicles.
     constexpr int preview_scale = 16;
     set_draw_scale( preview_scale );
@@ -4540,8 +4571,10 @@ bool cata_tiles::draw_vehicle_preview( const catacurses::window &w_disp, const v
     // Target window rectangle, in screen pixels.
     const window_dimensions dim = get_window_dimensions( w_disp );
     const point win_px_beg = dim.window_pos_pixel;
-    const point win_px_size = dim.window_size_pixel;
-    const point center_px = win_px_beg + win_px_size / 2;
+    // This panel is drawn into the logical display buffer. Generic window
+    // dimensions include UI scaling in their size, but not their position.
+    const point win_px_size = dim.window_size_pixel / get_scaling_factor();
+    const point center_px = win_px_beg + ( win_px_size - point( tile_width, tile_height ) ) / 2;
 
     // Repurpose the draw origin so a synthetic tile coordinate maps straight to a screen
     // pixel: player_to_screen( pos ) == op + ( pos - o ) * { tile_width, tile_height } in the
@@ -4549,8 +4582,15 @@ bool cata_tiles::draw_vehicle_preview( const catacurses::window &w_disp, const v
     // lands at the centre, where the cursor part is drawn.
     o = point::zero;
     op = center_px;
+    m_entity_draw_offset = point::zero;
 
     // Clip to the panel so an oversized vehicle does not bleed into neighbouring windows.
+    const bool had_clip = RenderIsClipEnabled( renderer );
+    SDL_Rect saved_clip;
+    RenderGetClipRect( renderer, &saved_clip );
+    on_out_of_scope restore_clip( [this, had_clip, saved_clip]() {
+        RenderSetClipRect( renderer, had_clip ? &saved_clip : nullptr );
+    } );
     const SDL_Rect clip{ win_px_beg.x, win_px_beg.y, win_px_size.x, win_px_size.y };
     RenderSetClipRect( renderer, &clip );
 
@@ -4589,15 +4629,31 @@ bool cata_tiles::draw_vehicle_preview( const catacurses::window &w_disp, const v
     }
     cpart = center_part;
 
+    if( selection ) {
+        const SDL_Rect area = vehicle_preview_selection_rect( selection->first, selection->second,
+                              cursor_vp_mount, center_px, point( tile_width, tile_height ) );
+        SDL_BlendMode saved_blend = SDL_BLENDMODE_NONE;
+        GetRenderDrawBlendMode( renderer, saved_blend );
+        SDL_Color saved_color{ 0, 0, 0, 255 };
+        SDL_GetRenderDrawColor( renderer.get(), &saved_color.r, &saved_color.g, &saved_color.b,
+                                &saved_color.a );
+        on_out_of_scope restore_overlay_state( [this, saved_blend, saved_color]() {
+            SetRenderDrawBlendMode( renderer, saved_blend );
+            SetRenderDrawColor( renderer, saved_color.r, saved_color.g, saved_color.b, saved_color.a );
+        } );
+        SetRenderDrawBlendMode( renderer, SDL_BLENDMODE_BLEND );
+        // Include empty cells while keeping the vehicle sprites visible below the selection.
+        geometry->rect( renderer, area, SDL_Color{ 64, 160, 255, 72 } );
+        SetRenderDrawColor( renderer, 96, 192, 255, 255 );
+        RenderDrawRect( renderer, &area );
+    }
+
     // Mark the selected cell with the "cursor" sprite (the yellow selection box, the same
     // sprite the look-around cursor uses). The cursor part is at the synthetic origin, i.e.
     // the window centre. Drawn after the parts so it sits on top, and still inside the clip.
     draw_from_id_string( "cursor", tripoint_bub_ms( tripoint::zero ), 0, 0, lit_level::LIT,
                          false );
 
-    // Restore the clip rectangle and the map draw scale.
-    RenderSetClipRect( renderer, nullptr );
-    set_draw_scale( saved_zoom );
     return true;
 }
 
@@ -4620,11 +4676,8 @@ SDL_Texture *cata_tiles::render_character_preview( const Character &ch, const in
     const int saved_zoom = g->get_zoom();
     set_draw_scale( scale );
 
-    // Character sprites are not tile-sized: they carry per-sprite offsets and overlays (hair,
-    // hats, mutations) that extend above and around the base tile by an amount that varies per
-    // tileset. Rather than guess a headroom that fits every case, draw into a generous work
-    // canvas, then read the rendered pixels back to find the tight non-transparent bounding box
-    // and crop to exactly that. This removes the dead space above the sprite for any tileset.
+    // Use the opaque sprite bounds cached when the tileset was loaded. Reading
+    // pixels back from the GPU here stalls every appearance change on mobile.
     const int work_w = tile_width * 3;
     const int work_h = tile_height * 3;
     if( work_w <= 0 || work_h <= 0 ) {
@@ -4650,8 +4703,12 @@ SDL_Texture *cata_tiles::render_character_preview( const Character &ch, const in
     o = point::zero;
     m_entity_draw_offset = point::zero;
 
-    // Pixel buffer for readback: ARGB8888, 4 bytes per pixel.
-    std::vector<uint32_t> pixels( static_cast<size_t>( work_w ) * work_h, 0 );
+    sprite_screen_bounds bounds;
+    sprite_screen_bounds *const previous_bounds = m_cur_bounds;
+    m_cur_bounds = &bounds;
+    on_out_of_scope restore_bounds( [&]() {
+        m_cur_bounds = previous_bounds;
+    } );
     bool drawn = false;
     {
         scoped_render_target preview_scope( renderer, char_preview_work_tex.get()
@@ -4670,9 +4727,7 @@ SDL_Texture *cata_tiles::render_character_preview( const Character &ch, const in
             draw_entity_with_overlays( ch, tripoint_bub_ms( tripoint::zero ), lit_level::BRIGHT,
                                        height_3d, FacingDirection::RIGHT );
 
-            const SDL_Rect full{ 0, 0, work_w, work_h };
-            drawn = RenderReadPixels( renderer, &full, SDL_PIXELFORMAT_ARGB8888, pixels.data(),
-                                      work_w * 4 );
+            drawn = bounds.valid;
             RenderSetClipRect( renderer, nullptr );
         }
     }
@@ -4682,22 +4737,9 @@ SDL_Texture *cata_tiles::render_character_preview( const Character &ch, const in
         return nullptr;
     }
 
-    // Scan for the bounding box of any non-zero (non-transparent) pixel. The canvas was cleared
-    // to all-zero bytes, so a pixel is "drawn" iff it is non-zero -- no need to assume which byte
-    // is alpha, sidestepping format/endianness concerns.
-    point min( work_w, work_h );
-    point max = point::north_west;
-    for( int y = 0; y < work_h; y++ ) {
-        const uint32_t *row = pixels.data() + static_cast<size_t>( y ) * work_w;
-        for( int x = 0; x < work_w; x++ ) {
-            if( row[x] != 0 ) {
-                min.x = std::min( min.x, x );
-                max.x = std::max( max.x, x );
-                min.y = std::min( min.y, y );
-                max.y = std::max( max.y, y );
-            }
-        }
-    }
+    const point min( std::max( 0, bounds.x ), std::max( 0, bounds.y ) );
+    const point max( std::min( work_w, bounds.x + bounds.w ) - 1,
+                     std::min( work_h, bounds.y + bounds.h ) - 1 );
 
     if( max.x < min.x || max.y < min.y ) {
         // Nothing was drawn (e.g. a tileset with no player sprite); show nothing.

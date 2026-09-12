@@ -36,7 +36,9 @@ template <typename E> struct enum_traits;
 namespace cata::lua_platform
 {
 class content_transaction;
+class items_content_transaction;
 } // namespace cata::lua_platform
+enum scaling_stat : int;
 
 enum class recipe_filter_flags : int {
     none = 0,
@@ -49,6 +51,23 @@ enum class recipe_time_flag : int {
     ignore_proficiencies = 1,
 };
 
+/** How the rot of crafting components carries over to the result. */
+enum class rot_inherit_mode : int {
+    /** Automatic: gate first, then domain-based (weighted blend when cooked, max otherwise). */
+    DEFAULT = 0,
+    /** Inherit the highest relative rot among components. */
+    MAX = 1,
+    /** Inherit the mass-weighted average relative rot, with extra mass for going-bad components. */
+    WEIGHTED = 2,
+    /** Inherit the shortest remaining lifespan among components. */
+    SHORTEST = 3,
+    /** Mass-weighted average floored at the highest relative rot scaled by the
+     * going-bad components' mass fraction. */
+    PRESERVE_BLEND = 4,
+    /** The in-progress craft does not rot and the result stays fresh. */
+    FRESH = 5,
+};
+
 template<>
 struct enum_traits<recipe_time_flag> {
     static constexpr bool is_flag_enum = true;
@@ -58,6 +77,7 @@ template<>
 struct enum_traits<recipe_filter_flags> {
     static constexpr bool is_flag_enum = true;
 };
+
 
 struct recipe_proficiency {
     proficiency_id id;
@@ -69,6 +89,27 @@ struct recipe_proficiency {
     std::optional<time_duration> max_experience = std::nullopt;
 
     void load( const JsonObject &jo );
+    void deserialize( const JsonObject &jo );
+};
+
+
+struct vitamin_resource_cost {
+    vitamin_id vitamin;
+    int value = 0;
+    std::optional<int> safe_level;
+
+    void deserialize( const JsonObject &jo );
+};
+
+struct character_resource_costs {
+    int mana = 0;
+    int stamina = 0;
+    std::vector<vitamin_resource_cost> vitamins;
+
+    bool empty() const {
+        return mana == 0 && stamina == 0 && vitamins.empty();
+    }
+
     void deserialize( const JsonObject &jo );
 };
 
@@ -165,6 +206,7 @@ class recipe
         friend class recipe_dictionary;
         friend struct mod_tracker;
         friend class cata::lua_platform::content_transaction;
+        friend class cata::lua_platform::items_content_transaction;
 
     private:
         itype_id result_ = itype_id::NULL_ID();
@@ -242,6 +284,11 @@ class recipe
             return id;
         }
 
+        /** Returns the character resource costs required to complete this recipe. */
+        const character_resource_costs &get_character_resources() const {
+            return character_resources;
+        }
+
         bool is_blacklisted() const {
             return requirements_.is_blacklisted();
         }
@@ -275,9 +322,13 @@ class recipe
         /// @param decorated whether the result includes decoration (favorite mark, etc).
         std::string result_name( bool decorated = false ) const;
         std::vector<effect_on_condition_id> result_eocs;
+        std::string lua_platform_mod;
+        std::string lua_platform_result_handler;
         std::pair<int, time_duration> morale_modifier;
         skill_id skill_used;
         std::map<skill_id, int> required_skills;
+        /** Character resource costs required to complete this recipe */
+        character_resource_costs character_resources;
         // For step recipes, use get_proficiencies() instead -- this field is empty.
         std::vector<recipe_proficiency> proficiencies;
 
@@ -291,6 +342,13 @@ class recipe
         std::set<recipe_id> nested_category_data;
 
         std::set<flag_id> flags_to_delete; // Flags to delete from the resultant item.
+
+        // Returns true if the character satisfies all configured stat requirements.
+        bool character_meets_requirements( const Character &character ) const;
+        // Returns true if the recipe has any character stat requirements.
+        bool has_character_requirements() const;
+        // Returns the character stat requirements configured for this recipe.
+        const std::map<scaling_stat, int> &get_character_requirements() const;
 
         // Create a string list to describe the skill requirements for this recipe
         // Format: skill_name(level/amount), skill_name(level/amount)
@@ -427,6 +485,9 @@ class recipe
 
         bool removes_raw() const;
 
+        /** How component rot carries over to the result (see @ref rot_inherit_mode). */
+        rot_inherit_mode get_rot_inherit() const;
+
         // Return the amount the recipe will produce (be it charges, or whole items).
         int makes_amount() const;
 
@@ -468,6 +529,9 @@ class recipe
         /** Requires specified inline with the recipe (and replaced upon inheritance) */
         std::vector<std::pair<requirement_id, int>> reqs_internal;
 
+        /** Character stat requirements. */
+        std::map<scaling_stat, int> character_requirements_;
+
         /** Combined requirements cached when recipe finalized */
         requirement_data requirements_;
 
@@ -489,6 +553,9 @@ class recipe
 
         /** Legacy definitions for byproducts **/
         std::map<itype_id, int> byproducts;
+
+        /** Component rot inheritance mode, see @ref rot_inherit_mode. */
+        rot_inherit_mode rot_inherit_ = rot_inherit_mode::DEFAULT;
 
         /** Item group representing byproducts **/
         std::optional<item_group_id> byproduct_group;

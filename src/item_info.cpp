@@ -28,7 +28,7 @@
 #include "bodygraph.h"
 #include "bodypart.h"
 #include "calendar.h"
-#include "catalua_platform_runtime.h"
+#include "lua_platform_runtime.h"
 #include "cata_utility.h"
 #include "character.h"
 #include "character_martial_arts.h"
@@ -4099,8 +4099,9 @@ static bool can_craft_recipe( const recipe *r, const inventory &crafting_inv )
     if( can_craft_recipe_cache.count( r ) > 0 ) {
         return can_craft_recipe_cache.at( r );
     }
-    can_craft_recipe_cache[r] = r->deduped_requirements().can_make_with_inventory( crafting_inv,
-                                r->get_component_filter() );
+    can_craft_recipe_cache[r] = r->deduped_requirements().can_make_with_inventory(
+                                    &get_player_character(), crafting_inv,
+                                    r->get_component_filter() );
     return can_craft_recipe_cache.at( r );
 }
 

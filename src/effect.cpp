@@ -1,5 +1,8 @@
 #include "effect.h"
 
+#include <calendar.h>
+#include <translation.h>
+#include <type_id.h>
 #include <algorithm>
 #include <cmath>
 #include <map>
@@ -8,7 +11,6 @@
 
 #include "bodypart.h"
 #include "cata_assert.h"
-#include "catalua_platform_content.h"
 #include "character.h"
 #include "color.h"
 #include "debug.h"
@@ -19,6 +21,7 @@
 #include "flexbuffer_json.h"
 #include "generic_factory.h"
 #include "json.h"
+#include "lua_platform_content.h"
 #include "magic_enchantment.h"
 #include "messages.h"
 #include "mod_manager.h"
@@ -421,6 +424,18 @@ void effect_type::load_mod_data( const JsonObject &j )
         {"stim_chance",      mod_action::CHANCE_TOP},
         {"stim_chance_bot",  mod_action::CHANCE_BOT},
         {"stim_tick",        mod_action::TICK},
+    } );
+
+    // Then focus
+    extract_effect( to_extract, "FOCUS", {
+        {"focus_amount",      mod_action::AMOUNT},
+        {"focus_min",         mod_action::MIN},
+        {"focus_max",         mod_action::MAX},
+        {"focus_min_val",     mod_action::MIN_VAL},
+        {"focus_max_val",     mod_action::MAX_VAL},
+        {"focus_chance",      mod_action::CHANCE_TOP},
+        {"focus_chance_bot",  mod_action::CHANCE_BOT},
+        {"focus_tick",        mod_action::TICK},
     } );
 
     // Then health
@@ -961,6 +976,9 @@ std::string effect::disp_desc( bool reduced ) const
     val = get_avg_mod( "SLEEPINESS", reduced );
     values.emplace_back( get_percentage( "SLEEPINESS", val, reduced ), val, _( "sleepiness" ),
                          _( "rest" ) );
+    val = get_avg_mod( "FOCUS", reduced );
+    values.emplace_back( get_percentage( "FOCUS", val, reduced ), val, _( "focus" ),
+                         _( "distraction" ) );
     val = get_avg_mod( "COUGH", reduced );
     values.emplace_back( get_percentage( "COUGH", val, reduced ), val, _( "coughing" ),
                          _( "coughing" ) );

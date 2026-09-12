@@ -1,6 +1,11 @@
 // Monster movement code; essentially, the AI
 #include "monster.h" // IWYU pragma: associated
 
+#include <bodypart.h>
+#include <calendar.h>
+#include <character_id.h>
+#include <coordinates.h>
+#include <creature.h>
 #include <algorithm>
 #include <cfloat>
 #include <climits>
@@ -16,7 +21,6 @@
 #include "bionics.h"
 #include "cata_assert.h"
 #include "cata_utility.h"
-#include "catalua_ui.h"
 #include "character.h"
 #include "creature_tracker.h"
 #include "damage.h"
@@ -29,6 +33,7 @@
 #include "gates.h"
 #include "item.h"
 #include "line.h"
+#include "lua_platform_hooks.h"
 #include "map.h"
 #include "map_iterator.h"
 #include "map_scale_constants.h"
@@ -57,6 +62,7 @@
 #include "vehicle.h"
 #include "viewer.h"
 #include "vpart_position.h"
+#include "weather.h"
 
 static const damage_type_id damage_bash( "bash" );
 static const damage_type_id damage_cut( "cut" );
@@ -87,12 +93,15 @@ static const field_type_str_id field_fd_last_known( "fd_last_known" );
 static const flag_id json_flag_AQUATIC( "AQUATIC" );
 static const flag_id json_flag_CANNOT_ATTACK( "CANNOT_ATTACK" );
 static const flag_id json_flag_CANNOT_MOVE( "CANNOT_MOVE" );
+static const flag_id json_flag_FLIES( "FLIES" );
 static const flag_id json_flag_GRAB( "GRAB" );
 static const flag_id json_flag_GRAB_FILTER( "GRAB_FILTER" );
 
 static const itype_id itype_gasoline( "gasoline" );
 static const itype_id itype_napalm( "napalm" );
 static const itype_id itype_pressurized_tank( "pressurized_tank" );
+
+static const json_character_flag json_flag_SNOWWALKING( "SNOWWALKING" );
 
 static const material_id material_iflesh( "iflesh" );
 
@@ -1815,6 +1824,19 @@ int monster::calc_movecost( const map &here, const tripoint_bub_ms &from,
             return 0;
         }
         cost += fieldcost;
+
+        // snow
+        int snowcost = 0;
+        if( where == to && here.is_outside( pos_bub() ) && !here.is_roofed( pos_bub() ) &&
+            !terrain.has_flag( ter_furn_flag::TFLAG_SWIMMABLE ) &&
+            !terrain.has_flag( ter_furn_flag::TFLAG_SWIM_UNDER ) ) {
+            const double snow_mm = get_weather().get_snow_depth_mm( pos_abs_omt() );
+            if( snow_mm >= 100 && !has_flag( json_flag_FLIES ) && !has_flag( json_flag_SNOWWALKING ) ) {
+                snowcost = snow_mm >= 500 ? 4 : ( snow_mm >= 250 ? 2 : 1 );
+            }
+        }
+
+        cost += snowcost;
     }
 
     int movecost = std::max( tilecosts[from] + tilecosts[to], 1 ) * 25;
@@ -2080,22 +2102,22 @@ bool monster::move_to( const tripoint_bub_ms &p, bool force, bool step_on_critte
     map &here = get_map();
     const tripoint_bub_ms pos = pos_bub( here );
 
-    if( cata::lua_ui::has_native_hook( "on_monster_try_move" ) ) {
-        const cata::lua_ui::native_callback_arguments payload = {
+    if( cata::lua_platform::has_native_hook( "on_monster_try_move" ) ) {
+        const cata::lua_platform::native_callback_arguments payload = {
             { "monster", static_cast<const Creature *>( this ) },
             {
-                "from", cata::lua_ui::native_callback_point {
+                "from", cata::lua_platform::native_callback_point {
                     "bub_ms", tripoint_rel_ms( pos.x(), pos.y(), pos.z() )
                 }
             },
             {
-                "to", cata::lua_ui::native_callback_point {
+                "to", cata::lua_platform::native_callback_point {
                     "bub_ms", tripoint_rel_ms( p.x(), p.y(), p.z() )
                 }
             },
             { "force", force }
         };
-        if( !cata::lua_ui::dispatch_native_hook(
+        if( !cata::lua_platform::dispatch_native_hook(
                 "on_monster_try_move", payload ) ) {
             return false;
         }

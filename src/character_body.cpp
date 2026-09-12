@@ -49,8 +49,6 @@
 #include "weather.h"
 #include "weather_gen.h"
 
-class item;
-
 static const addiction_id addiction_nicotine( "nicotine" );
 
 static const bionic_id bio_sleep_shutdown( "bio_sleep_shutdown" );
@@ -66,6 +64,7 @@ static const efftype_id effect_betablock( "betablock" );
 static const efftype_id effect_bite( "bite" );
 static const efftype_id effect_bleed( "bleed" );
 static const efftype_id effect_blisters( "blisters" );
+static const efftype_id effect_caffeine_eff( "caffeine_eff" );
 static const efftype_id effect_cig( "cig" );
 static const efftype_id effect_cold( "cold" );
 static const efftype_id effect_common_cold( "common_cold" );
@@ -126,6 +125,7 @@ static const trait_id trait_SLIMY( "SLIMY" );
 static const trait_id trait_URSINE_FUR( "URSINE_FUR" );
 
 static const vitamin_id vitamin_blood( "blood" );
+static const vitamin_id vitamin_nicotine( "nicotine" );
 
 void Character::update_body_wetness( const w_point &weather )
 {
@@ -447,8 +447,8 @@ void Character::update_bodytemp()
     }
     const oter_id &cur_om_ter = overmap_buffer.ter( pos_abs_omt() );
     bool sheltered = g->is_sheltered( pos_bub() );
-    int bp_windpower = get_local_windpower( weather_man.windspeed + vehwindspeed, cur_om_ter,
-                                            pos_abs(), weather_man.winddirection, sheltered );
+    const int windpower = get_local_windpower( weather_man.windspeed + vehwindspeed, cur_om_ter,
+                          pos_abs(), weather_man.winddirection, sheltered );
     // Let's cache this not to check it for every bodyparts
     const bool has_bark = has_flag( json_flag_BARKY );
     const bool has_sleep = has_effect( effect_sleep );
@@ -515,10 +515,6 @@ void Character::update_bodytemp()
     const int radiation_blister_count = h_radiation > 44_C_delta ? static_cast<int>( std::sqrt(
                                             units::to_fahrenheit_delta( h_radiation - 44_C_delta ) ) ) : 0;
 
-    std::map<bodypart_id, std::vector<const item *>> clothing_map;
-    for( const bodypart_id &bp : get_all_body_parts() ) {
-        clothing_map.emplace( bp, std::vector<const item *>() );
-    }
     // fat insulates and increases total heat production of body, but it should have a diminishing effect.
     // at 5 over healthy bmi (obese), it is ~5 warmth, at 20 over healthy bmi (morbid obesity) it is ~12 warmth
     // effects start to kick in halfway through overweightness
@@ -526,7 +522,7 @@ void Character::update_bodytemp()
             ( get_bmi_fat() - 8.0f ) ) );
     std::map<bodypart_id, int> warmth_per_bp = worn.warmth( *this );
     std::map<bodypart_id, int> bonus_warmth_per_bp = bonus_item_warmth();
-    std::map<bodypart_id, int> wind_res_per_bp = get_wind_resistance( clothing_map );
+    std::map<bodypart_id, int> wind_res_per_bp = get_wind_resistance();
     // We might not use this at all, so leave it empty
     // If we do need to use it, we'll initialize it (once) there
     std::map<bodypart_id, int> fire_armor_per_bp;
@@ -555,8 +551,8 @@ void Character::update_bodytemp()
                 bonus_warmth_per_bp[bp];
         // WINDCHILL
 
-        bp_windpower = static_cast<int>( static_cast<float>( bp_windpower ) *
-                                         ( 1 - wind_res_per_bp[bp] / 100.0 ) );
+        const int bp_windpower = static_cast<int>( static_cast<float>( windpower ) *
+                                 ( 1 - wind_res_per_bp[bp] / 100.0 ) );
         // Calculate windchill (local_humidity precomputed above; loop-invariant)
         units::temperature_delta windchill = get_local_windchill( player_local_temp,
                                              local_humidity, bp_windpower );
@@ -620,7 +616,7 @@ void Character::update_bodytemp()
             blister_count -= 20;
         }
         if( fire_armor_per_bp.empty() && blister_count > 0 ) {
-            fire_armor_per_bp = get_all_armor_type( damage_heat, clothing_map );
+            fire_armor_per_bp = get_all_armor_type( damage_heat );
         }
         if( blister_count - fire_armor_per_bp[bp] > 0 ) {
             add_effect( effect_blisters, 1_turns, bp );
@@ -1472,13 +1468,25 @@ void Character::update_heartrate_index()
         hr_stim_mod = 2 - 2 / ( 1 + 0.001 * stim_level * stim_level );
     }
     float hr_nicotine_mod = 0.0f;
-    if( get_effect_dur( effect_cig ) > 0_turns ) {
-        //Nicotine-induced tachycardia
-        if( get_effect_dur( effect_cig ) >
-            10_minutes * ( addiction_level( addiction_nicotine ) + 1 ) ) {
+    if( has_effect( effect_cig ) ) {
+        //Nicotine-induced tachycardia.  The excess effect is permanent, so compare
+        //nicotine load to tolerance: 1 unit decays per vitamin rate, 10 min = 2 units.
+        if( vitamin_get( vitamin_nicotine ) >
+            2 * ( addiction_level( addiction_nicotine ) + 1 ) ) {
             hr_nicotine_mod = 0.2f;
         } else {
             hr_nicotine_mod = 0.1f;
+        }
+    }
+    float hr_caffeine_mod = 0.0f;
+    if( has_effect( effect_caffeine_eff ) ) {
+        //Caffeine overdose causes palpitations; severe caffeine toxicity causes tachycardia and arrhythmia.
+        const int caff_int = get_effect( effect_caffeine_eff ).get_intensity();
+        if( caff_int >= 3 ) {
+            hr_caffeine_mod = 0.1f;
+        }
+        if( caff_int >= 4 ) {
+            hr_caffeine_mod = 0.3f;
         }
     }
     // ********************
@@ -1557,7 +1565,7 @@ void Character::update_heartrate_index()
     const float hr_effect_mod = effect_mod * HR_EFFECT_INT_TO_FLOAT_MULT;
 
     heart_rate_index = 1.0f + hr_temp_mod + hr_activity_mods + hr_stim_mod + hr_nicotine_mod
-                       + hr_bp_loss_mod + hr_effect_mod;
+                       + hr_caffeine_mod + hr_bp_loss_mod + hr_effect_mod;
 }
 
 float Character::get_bloodvol_index() const

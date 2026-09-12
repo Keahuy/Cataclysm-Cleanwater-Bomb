@@ -1,7 +1,5 @@
-#include "catalua_platform_content.h"
-
-#include "item_factory.h"
-
+#include <iuse.h>
+#include <type_id.h>
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -43,11 +41,13 @@
 #include "input.h"
 #include "item.h"
 #include "item_contents.h"
+#include "item_factory.h"
 #include "item_group.h"
 #include "item_pocket.h"
 #include "item_transformation.h"
 #include "itype.h"
 #include "iuse_actor.h"
+#include "lua_platform_content.h"
 #include "mapdata.h"
 #include "material.h"
 #include "math_parser_diag_value.h"
@@ -2266,7 +2266,6 @@ void Item_factory::init()
     add_iuse( "WEAK_ANTIBIOTIC", &iuse::weak_antibiotic );
     add_iuse( "WEATHER_TOOL", &iuse::weather_tool );
     add_iuse( "SEXTANT", &iuse::sextant );
-    add_iuse( "WEED_CAKE", &iuse::weed_cake );
     add_iuse( "XANAX", &iuse::xanax );
     add_iuse( "BREAK_STICK", &iuse::break_stick );
     add_iuse( "LUX_METER", &iuse::lux_meter );
@@ -3847,7 +3846,7 @@ class vitamins_reader : public generic_typed_reader<vitamins_reader>
 
 void islot_comestible::deserialize( const JsonObject &jo )
 {
-    std::string src = "dda";
+    std::string src = "ccb";
 
     mandatory( jo, was_loaded, "comestible_type", comesttype );
     optional( jo, was_loaded, "tool", tool, itype_id::NULL_ID() );

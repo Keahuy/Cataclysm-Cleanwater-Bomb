@@ -53,6 +53,7 @@ template <typename E> struct enum_traits;
 namespace cata::lua_platform
 {
 class content_transaction;
+class items_content_transaction;
 } // namespace cata::lua_platform
 
 class gun_modifier_data
@@ -282,6 +283,8 @@ struct islot_comestible {
 
         /**effect on conditions to apply on consumption*/
         std::vector<effect_on_condition_id> consumption_eocs;
+        std::string lua_platform_mod; // NOLINT(cata-serialize)
+        std::string lua_platform_consume_handler; // NOLINT(cata-serialize)
 
         /**List of diseases carried by this comestible and their associated probability*/
         std::map<diseasetype_id, float> contamination;
@@ -307,6 +310,11 @@ struct islot_comestible {
 
         int get_fun() const {
             return fun;
+        }
+
+        /** Set the fixed base enjoyment used by typed runtime content builders. */
+        void set_fun( const int value ) {
+            fun = value;
         }
 
         /** The monster that is drawn from when the item rots away */
@@ -1423,6 +1431,7 @@ struct itype {
         friend class Item_factory;
         friend struct mod_tracker;
         friend class cata::lua_platform::content_transaction;
+        friend class cata::lua_platform::items_content_transaction;
 
         using FlagsSetType = cata::flat_set<flag_id>;
 

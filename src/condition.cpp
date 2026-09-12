@@ -38,7 +38,6 @@
 #include "flag.h"
 #include "flexbuffer_json.h"
 #include "game.h"
-#include "game_constants.h"
 #include "generic_factory.h"
 #include "global_vars.h"
 #include "inventory.h"
@@ -51,11 +50,12 @@
 #include "mapdata.h"
 #include "martialarts.h"
 #include "math_parser.h"
+#include "math_parser_diag_value.h"
 #include "math_parser_type.h"
 #include "memory_fast.h"
 #include "messages.h"
-#include "math_parser_diag_value.h"
 #include "mission.h"
+#include "mod_id_compat.h"
 #include "mtype.h"
 #include "mutation.h"
 #include "npc.h"
@@ -187,19 +187,19 @@ std::string get_talk_var_basename( const JsonObject &jo, std::string_view member
 namespace
 {
 
-template<typename valueT, typename funcT>
-value_or_var_pair<valueT, funcT> get_value_or_var_pair( const JsonValue &jv )
+template<typename valueT, typename... funcT>
+value_or_var_pair<valueT, funcT...> get_value_or_var_pair( const JsonValue &jv )
 {
-    value_or_var_pair<valueT, funcT> ret_val;
+    value_or_var_pair<valueT, funcT...> ret_val;
     ret_val.deserialize( jv );
     return ret_val;
 }
 
-template<typename retT, typename funcT>
-value_or_var_pair<retT, funcT> get_value_or_var_pair( const JsonObject &jo,
+template<typename retT, typename... funcT>
+value_or_var_pair<retT, funcT...> get_value_or_var_pair( const JsonObject &jo,
         std::string_view member, bool required, retT default_val )
 {
-    value_or_var_pair<retT, funcT> ret_val;
+    value_or_var_pair<retT, funcT...> ret_val;
     if( required ) {
         mandatory( jo, false, member, ret_val );
     } else {
@@ -213,14 +213,16 @@ value_or_var_pair<retT, funcT> get_value_or_var_pair( const JsonObject &jo,
 dbl_or_var get_dbl_or_var( const JsonObject &jo, std::string_view member, bool required,
                            double default_val )
 {
-    return get_value_or_var_pair<double, eoc_math>( jo, member, required, default_val );
+    return get_value_or_var_pair<double, eoc_math, runtime_dbl_provider>(
+               jo, member, required, default_val );
 }
 
 duration_or_var get_duration_or_var( const JsonObject &jo, std::string_view member,
                                      bool required,
                                      time_duration default_val )
 {
-    return get_value_or_var_pair<time_duration, eoc_math>( jo, member, required, default_val );
+    return get_value_or_var_pair<time_duration, eoc_math, runtime_duration_provider>(
+               jo, member, required, default_val );
 }
 
 str_or_var get_str_or_var( const JsonValue &jv, std::string_view /* member */, bool /* required */,
@@ -744,6 +746,20 @@ conditional_t::func f_has_items_sum( const JsonObject &jo, std::string_view memb
         double total_present;
         const Character *you = d.const_actor( is_npc )->get_const_character();
         inventory inventory_and_around = you->crafting_inventory( you->pos_bub(), pickup_range );
+
+        // Include cargo from vehicles owned by the actor's faction.  Vehicle
+        // inventories are not part of crafting_inventory(), but mission
+        // deliveries should accept items stored in the player's truck.
+        map &here = get_map();
+        for( const wrapped_vehicle &wv : here.get_vehicles() ) {
+            if( wv.v->owner == you->get_faction_id() ) {
+                for( const tripoint_abs_ms &veh_pt : wv.v->get_points() ) {
+                    if( optional_vpart_position vp = here.veh_at( veh_pt ) ) {
+                        vp->form_inventory( here, inventory_and_around );
+                    }
+                }
+            }
+        }
 
         for( const auto &pair : item_and_amount ) {
             item_to_find = itype_id( pair.first.evaluate( d ) );
@@ -1774,9 +1790,9 @@ conditional_t::func f_mod_is_loaded( const JsonObject &jo, std::string_view memb
 {
     str_or_var compared_mod = get_str_or_var( jo.get_member( member ), member, true );
     return [compared_mod]( const_dialogue const & d ) {
-        mod_id comp_mod = mod_id( compared_mod.evaluate( d ) );
+        const mod_id comp_mod = canonical_mod_id( mod_id( compared_mod.evaluate( d ) ) );
         for( const mod_id &mod : world_generator->active_world->active_mod_order ) {
-            if( comp_mod == mod ) {
+            if( comp_mod == canonical_mod_id( mod ) ) {
                 return true;
             }
         }

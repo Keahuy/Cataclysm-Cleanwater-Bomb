@@ -1,5 +1,7 @@
 #include "crafting.h"
 
+#include <item_wakeup.h>
+
 #define MP_ENABLED
 #include <algorithm>
 #include <climits>
@@ -14,6 +16,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -24,7 +27,6 @@
 #include "calendar.h"
 #include "cata_assert.h"
 #include "cata_utility.h"
-#include "catalua_ui.h"
 #include "character.h"
 #include "character_attire.h"
 #include "character_id.h"
@@ -55,7 +57,11 @@
 #include "itype.h"
 #include "iuse.h"
 #include "line.h"
+#include "lua_platform_hooks.h"
+#include "lua_platform_runtime.h"
+#include "magic.h"
 #include "magic_enchantment.h"
+#include "magic_type.h"
 #include "map.h"
 #include "map_iterator.h"
 #include "map_selector.h"
@@ -90,6 +96,7 @@
 #include "vehicle.h"
 #include "vehicle_selector.h"
 #include "visitable.h"
+#include "vitamin.h"
 #include "vpart_position.h"
 #include "weather.h"
 #ifdef MP_ENABLED
@@ -107,9 +114,7 @@ static const furn_str_id furn_f_fake_bench_hands( "f_fake_bench_hands" );
 static const furn_str_id furn_f_ground_crafting_spot( "f_ground_crafting_spot" );
 
 static const itype_id itype_disassembly( "disassembly" );
-static const itype_id itype_pickaxe( "pickaxe" );
 static const itype_id itype_plut_cell( "plut_cell" );
-static const itype_id itype_shovel( "shovel" );
 static const itype_id itype_water_faucet( "water_faucet" );
 
 static const json_character_flag json_flag_CRAFT_IN_DARKNESS( "CRAFT_IN_DARKNESS" );
@@ -124,8 +129,7 @@ static const quality_id qual_BOIL( "BOIL" );
 static const skill_id skill_electronics( "electronics" );
 static const skill_id skill_tailor( "tailor" );
 
-static const trait_id trait_BURROW( "BURROW" );
-static const trait_id trait_BURROWLARGE( "BURROWLARGE" );
+
 static const trait_id trait_DEBUG_CNF( "DEBUG_CNF" );
 static const trait_id trait_DEBUG_HS( "DEBUG_HS" );
 static const trait_id trait_INT_ALPHA( "INT_ALPHA" );
@@ -636,12 +640,13 @@ bool Character::can_make( const recipe *r, int batch_size ) const
         return false;
     }
 
-    if( !r->character_has_required_proficiencies( *this ) ) {
+    if( !r->character_has_required_proficiencies( *this ) ||
+        !r->character_meets_requirements( *this ) ) {
         return false;
     }
 
     return r->deduped_requirements().can_make_with_inventory(
-               crafting_inv, r->get_component_filter(), batch_size );
+               this, crafting_inv, r->get_component_filter(), batch_size );
 }
 
 bool Character::can_start_craft( const recipe *rec, recipe_filter_flags flags,
@@ -651,13 +656,14 @@ bool Character::can_start_craft( const recipe *rec, recipe_filter_flags flags,
         return false;
     }
 
-    if( !rec->character_has_required_proficiencies( *this ) ) {
+    if( !rec->character_has_required_proficiencies( *this ) ||
+        !rec->character_meets_requirements( *this ) ) {
         return false;
     }
 
     const inventory &inv = crafting_inventory();
     return rec->deduped_requirements().can_make_with_inventory(
-               inv, rec->get_component_filter( flags ), batch_size, craft_flags::start_only );
+               this, inv, rec->get_component_filter( flags ), batch_size, craft_flags::start_only );
 }
 
 const inventory &Character::crafting_inventory( bool clear_path ) const
@@ -713,13 +719,8 @@ const inventory &Character::crafting_inventory( map *here, const tripoint_bub_ms
     }
     crafting_cache.crafting_inventory->replace_liq_container_count( tmp_liq_list, true );
 
-    for( const item *i : get_pseudo_items() ) {
-        *crafting_cache.crafting_inventory += *i;
-    }
-
-    if( has_trait( trait_BURROW ) || has_trait( trait_BURROWLARGE ) ) {
-        *crafting_cache.crafting_inventory += item( itype_pickaxe, calendar::turn );
-        *crafting_cache.crafting_inventory += item( itype_shovel, calendar::turn );
+    for( const item &i : crafting_pseudo_items() ) {
+        *crafting_cache.crafting_inventory += i;
     }
 
     crafting_cache.valid = true;
@@ -1285,7 +1286,7 @@ static bool env_qualities_satisfied_for_step( const recipe_step &step, const ite
     for( const std::vector<quality_requirement> &group : quals ) {
         bool group_ok = false;
         for( const quality_requirement &q : group ) {
-            if( q.has( inv, return_true<item> ) ) {
+            if( q.has( src.present_char, inv, return_true<item> ) ) {
                 group_ok = true;
                 break;
             }
@@ -2477,11 +2478,19 @@ void item::inherit_flags( const item_components &parents, const recipe &making )
     }
 }
 
-static void set_temp_rot( item &newit, const double relative_rot, const bool should_heat )
+static constexpr double COOK_SALVAGE_THRESHOLD = 0.5;
+static constexpr double COOK_ROT_MITIGATION = 0.85;
+
+static void set_temp_rot( item &newit, const double relative_rot, const bool should_heat,
+                          const double rot_mitigation )
 {
     if( newit.has_temperature() ) {
         if( newit.goes_bad() ) {
-            newit.set_relative_rot( relative_rot );
+            if( rot_mitigation < 1.0 && !newit.has_flag( flag_PROCESSING_RESULT ) ) {
+                newit.set_relative_rot( relative_rot * rot_mitigation );
+            } else {
+                newit.set_relative_rot( relative_rot );
+            }
         }
         if( should_heat ) {
             newit.heat_up();
@@ -2499,16 +2508,16 @@ static void set_temp_rot( item &newit, const double relative_rot, const bool sho
 
 static void spawn_items( Character &guy, std::vector<item> &results,
                          const std::optional<tripoint_bub_ms> &loc, const double relative_rot, const bool should_heat,
-                         bool allow_wield = false )
+                         const double rot_mitigation, bool allow_wield = false )
 {
     auto prepare = [&]( item & it ) {
         // todo: set this up recursively, who knows what kinda crafts will need it
         if( !it.empty() ) {
             for( item *new_content : it.all_items_top() ) {
-                set_temp_rot( *new_content, relative_rot, should_heat );
+                set_temp_rot( *new_content, relative_rot, should_heat, rot_mitigation );
             }
         }
-        set_temp_rot( it, relative_rot, should_heat );
+        set_temp_rot( it, relative_rot, should_heat, rot_mitigation );
         it.set_owner( guy.get_faction()->id );
     };
 
@@ -2588,6 +2597,12 @@ void Character::complete_craft( item &craft, const std::optional<tripoint_bub_ms
     item_components &used = craft.components;
     const double relative_rot = craft.get_relative_rot();
     const bool should_heat = making.hot_result();
+    // Cooking makes marginally old components safer, but a component at or past
+    // the salvage threshold is not recoverable (heat-stable toxins).
+    double rot_mitigation = 1.0;
+    if( should_heat && craft.max_components_relative_rot() < COOK_SALVAGE_THRESHOLD ) {
+        rot_mitigation = COOK_ROT_MITIGATION;
+    }
     const bool add_faults_to_results = craft.has_flag( flag_FAULT_ON_COMPLETION );
     std::vector<item> newits;
 
@@ -2601,10 +2616,10 @@ void Character::complete_craft( item &craft, const std::optional<tripoint_bub_ms
                 craft_result.set_random_fault_of_type( "crafting_defect" );
             }
         }
-        if( cata::lua_ui::has_native_hook(
+        if( cata::lua_platform::has_native_hook(
                 "on_craft_result" ) ) {
             for( item &craft_result : newits ) {
-                cata::lua_ui::dispatch_native_hook(
+                cata::lua_platform::dispatch_native_hook(
                 "on_craft_result", {
                     {
                         "character",
@@ -2612,7 +2627,7 @@ void Character::complete_craft( item &craft, const std::optional<tripoint_bub_ms
                     },
                     {
                         "recipe",
-                        cata::lua_ui::native_callback_id {
+                        cata::lua_platform::native_callback_id {
                             "recipe", making.ident().str()
                         }
                     },
@@ -2629,7 +2644,7 @@ void Character::complete_craft( item &craft, const std::optional<tripoint_bub_ms
         }
         // only wield crafted items if there's only one
         bool allow_wield = newits.size() == 1;
-        spawn_items( *this, newits, loc, relative_rot, should_heat, allow_wield );
+        spawn_items( *this, newits, loc, relative_rot, should_heat, rot_mitigation, allow_wield );
     }
 
     // messages, learning of recipe
@@ -2676,7 +2691,7 @@ void Character::complete_craft( item &craft, const std::optional<tripoint_bub_ms
 
     if( making.has_byproducts() ) {
         std::vector<item> bps = making.create_byproducts( batch_size );
-        spawn_items( *this, bps, loc, relative_rot, should_heat );
+        spawn_items( *this, bps, loc, relative_rot, should_heat, rot_mitigation );
     }
 
     recoil = MAX_RECOIL;
@@ -2691,6 +2706,9 @@ void Character::complete_craft( item &craft, const std::optional<tripoint_bub_ms
             eoc->activate_activation_only( d, "a recipe", "crafting", "recipe" );
         }
     }
+    cata::lua_platform::invoke_recipe_completion_handler(
+        making.ident().str(), making.lua_platform_mod,
+        making.lua_platform_result_handler, *this, batch_size );
 }
 
 bool Character::can_continue_craft( item &craft )
@@ -2726,7 +2744,7 @@ bool Character::can_continue_craft( item &craft, const requirement_data &continu
         // continue_reqs are for all batches at once
         const int batch_size = 1;
 
-        if( !continue_reqs.can_make_with_inventory( crafting_inventory(), std_filter, batch_size ) ) {
+        if( !continue_reqs.can_make_with_inventory( this, crafting_inventory(), std_filter, batch_size ) ) {
             if( is_avatar() ) {
                 std::string buffer = _( "You don't have the required components to continue crafting!" );
                 buffer += "\n";
@@ -2745,7 +2763,8 @@ bool Character::can_continue_craft( item &craft, const requirement_data &continu
             return false;
         }
 
-        if( !continue_reqs.can_make_with_inventory( crafting_inventory(), no_rotten_filter, batch_size ) ) {
+        if( !continue_reqs.can_make_with_inventory( this, crafting_inventory(), no_rotten_filter,
+                batch_size ) ) {
             if( !query_yn( _( "Some components required to continue are rotten.\n"
                               "Continue crafting anyway?" ) ) ) {
                 return false;
@@ -2753,7 +2772,7 @@ bool Character::can_continue_craft( item &craft, const requirement_data &continu
             use_rotten_filter = false;
         }
 
-        if( !continue_reqs.can_make_with_inventory( crafting_inventory(), no_favorite_filter,
+        if( !continue_reqs.can_make_with_inventory( this, crafting_inventory(), no_favorite_filter,
                 batch_size ) ) {
             if( !query_yn( _( "Some components required to continue are favorite.\n"
                               "Continue crafting anyway?" ) ) ) {
@@ -2830,7 +2849,7 @@ bool Character::can_continue_craft( item &craft, const requirement_data &continu
                 std::vector<std::vector<quality_requirement>>(),
                 std::vector<std::vector<item_comp>>() );
 
-        if( !tool_continue_reqs.can_make_with_inventory( crafting_inventory(), return_true<item> ) ) {
+        if( !tool_continue_reqs.can_make_with_inventory( this, crafting_inventory(), return_true<item> ) ) {
             if( is_avatar() ) {
                 std::string buffer = _( "You don't have the necessary tools to continue crafting!" );
                 buffer += "\n";
@@ -2949,7 +2968,7 @@ const requirement_data *Character::select_requirements(
         // Write with a large width and then just re-join the lines, because
         // uilist does its own wrapping and we want to rely on that.
         std::vector<std::string> component_lines =
-            req->get_folded_components_list( TERMX - 4, c_light_gray, inv, filter, batch, "",
+            req->get_folded_components_list( this, TERMX - 4, c_light_gray, inv, filter, batch, "",
                                              requirement_display_flags::no_unavailable );
         menu.addentry_desc( "", string_join( component_lines, "\n" ) );
     }
@@ -3285,6 +3304,10 @@ std::vector<item_location> preview_source_locations( Character &crafter,
         return candidate.typeId() == type && filter( candidate ) &&
                ( !preferred || is_preferred_component( candidate ) );
     };
+    const std::function<bool( const item & )> map_source_filter =
+    [&crafter, &source_filter]( const item & candidate ) {
+        return candidate.is_owned_by( crafter, true ) && source_filter( candidate );
+    };
     std::vector<item_location> locations;
     map &here = get_map();
     if( selection.use_from & usage_from::map ) {
@@ -3298,7 +3321,7 @@ std::vector<item_location> preview_source_locations( Character &crafter,
                 return true;
             } );
             for( item_location &location : at_point ) {
-                append_preview_source_locations( location, source_filter, locations );
+                append_preview_source_locations( location, map_source_filter, locations );
             }
         }
     }
@@ -3492,6 +3515,14 @@ std::list<item> Character::consume_items( map &m, const comp_selection<item_comp
     };
     std::function<bool( const item & )> preferred_filter = disable_preference ? filter :
             active_preferred_filter;
+    const std::function<bool( const item & )> map_filter =
+    [this, &filter]( const item & candidate ) {
+        return candidate.is_owned_by( *this, true ) && filter( candidate );
+    };
+    const std::function<bool( const item & )> map_preferred_filter =
+    [this, &preferred_filter]( const item & candidate ) {
+        return candidate.is_owned_by( *this, true ) && preferred_filter( candidate );
+    };
 
     std::list<item> ret;
 
@@ -3510,11 +3541,11 @@ std::list<item> Character::consume_items( map &m, const comp_selection<item_comp
     if( is.use_from & usage_from::map ) {
         if( by_charges ) {
             std::list<item> tmp = m.use_charges( reachable_pts, selected_comp.type, real_count,
-                                                 preferred_filter );
+                                                 map_preferred_filter );
             ret.splice( ret.end(), tmp );
         } else {
-            std::list<item> tmp = m.use_amount( reachable_pts, selected_comp.type, real_count, preferred_filter,
-                                                select_ind );
+            std::list<item> tmp = m.use_amount( reachable_pts, selected_comp.type, real_count,
+                                                map_preferred_filter, select_ind );
             remove_ammo( tmp, *this );
             ret.splice( ret.end(), tmp );
         }
@@ -3538,10 +3569,11 @@ std::list<item> Character::consume_items( map &m, const comp_selection<item_comp
     if( real_count > 0 ) {
         if( is.use_from & usage_from::map ) {
             if( by_charges ) {
-                std::list<item> tmp = m.use_charges( reachable_pts, selected_comp.type, real_count, filter );
+                std::list<item> tmp = m.use_charges( reachable_pts, selected_comp.type, real_count,
+                                                     map_filter );
                 ret.splice( ret.end(), tmp );
             } else {
-                std::list<item> tmp = m.use_amount( reachable_pts, selected_comp.type, real_count, filter,
+                std::list<item> tmp = m.use_amount( reachable_pts, selected_comp.type, real_count, map_filter,
                                                     select_ind );
                 remove_ammo( tmp, *this );
                 ret.splice( ret.end(), tmp );
@@ -4060,6 +4092,124 @@ bool Character::verify_step_tools( item &craft, int step_idx,
     return true;
 }
 
+int Character::craft_character_resource_available( const magic_energy_type resource ) const
+{
+    if( has_trait( trait_DEBUG_HS ) ) {
+        return std::numeric_limits<int>::max();
+    }
+    switch( resource ) {
+        case magic_energy_type::mana:
+            return magic->available_mana();
+        case magic_energy_type::stamina:
+            return get_stamina();
+        default:
+            return 0;
+    }
+}
+
+int Character::craft_vitamin_available( const vitamin_resource_cost &resource ) const
+{
+    if( has_trait( trait_DEBUG_HS ) ) {
+        return std::numeric_limits<int>::max();
+    }
+    const int minimum = resource.safe_level.value_or( resource.vitamin.obj().min() );
+    return std::max( 0, vitamin_get( resource.vitamin ) - minimum );
+}
+
+static int craft_resource_debit_for_progress( const item &craft, const std::string_view &var,
+        const int base_cost, const int batch, const int target_progress )
+{
+    const int64_t total_cost = static_cast<int64_t>( base_cost ) * batch;
+    const int64_t target_cost = total_cost * target_progress / 10000000;
+    const int consumed = static_cast<int>( craft.get_var( var, 0.0 ) );
+    return static_cast<int>( std::max<int64_t>( 0, target_cost - consumed ) );
+}
+
+bool Character::craft_consume_character_resources( item &craft, int target_progress, bool consume )
+{
+    if( has_trait( trait_DEBUG_HS ) ) {
+        return true;
+    }
+
+    const character_resource_costs &resources = craft.get_making().get_character_resources();
+    if( resources.empty() ) {
+        return true;
+    }
+
+    const int batch = craft.get_making_batch_size();
+    target_progress = std::clamp( target_progress, 0, 10000000 );
+
+    const auto process_resource = [&]( const int base_cost, const int available,
+                                       const std::string & var,
+    const std::string & resource_name, const bool apply, const auto & consume_resource ) {
+        if( base_cost == 0 ) {
+            return true;
+        }
+
+        const int debit = craft_resource_debit_for_progress( craft, var, base_cost, batch,
+                          target_progress );
+        if( !apply ) {
+            if( debit <= available ) {
+                return true;
+            }
+
+            add_msg_player_or_npc(
+                _( "You don't have enough %s to continue crafting." ),
+                _( "<npcname> doesn't have enough %s to continue crafting." ),
+                resource_name );
+            return false;
+        }
+
+        if( debit > 0 ) {
+            consume_resource( debit );
+            const int consumed = static_cast<int>( craft.get_var( var, 0.0 ) );
+            craft.set_var( var, consumed + debit );
+        }
+        return true;
+    };
+
+    const auto process_energy_resource = [&]( const int amount, const magic_energy_type resource,
+    const char *resource_name, const bool apply, const auto & consume_resource ) {
+        return process_resource( amount, craft_character_resource_available( resource ),
+                                 "craft_resource_" + io::enum_to_string( resource ), resource_name, apply,
+                                 consume_resource );
+    };
+
+    const auto process_resources = [&]( const bool apply ) {
+        if( !process_energy_resource( resources.mana, magic_energy_type::mana, _( "mana" ), apply,
+        [&]( const int debit ) {
+        magic->mod_mana( *this, -debit );
+        } ) ) {
+            return false;
+        }
+
+        if( !process_energy_resource( resources.stamina, magic_energy_type::stamina, _( "stamina" ),
+        apply, [&]( const int debit ) {
+        mod_stamina( -debit );
+        } ) ) {
+            return false;
+        }
+
+        for( const vitamin_resource_cost &resource : resources.vitamins ) {
+            if( !process_resource( resource.value, craft_vitamin_available( resource ),
+                                   "craft_vitamin_" + resource.vitamin.str(),
+            resource.vitamin.obj().name(), apply, [&]( const int debit ) {
+            vitamin_mod( resource.vitamin, -debit );
+            } ) ) {
+                return false;
+            }
+        }
+
+        return true;
+    };
+
+    if( !process_resources( false ) ) {
+        return false;
+    }
+
+    return !consume || process_resources( true );
+}
+
 bool Character::craft_consume_step_tools( item &craft, const crafting_cost_context *cost_ctx )
 {
     if( has_trait( trait_DEBUG_HS ) ) {
@@ -4251,7 +4401,7 @@ ret_val<void> Character::can_disassemble( const item &obj, const read_only_visit
 
     for( const auto &opts : dis.get_qualities() ) {
         for( const quality_requirement &qual : opts ) {
-            if( !qual.has( inv, return_true<item> ) ) {
+            if( !qual.has( this, inv, return_true<item> ) ) {
                 // Here should be no dot at the end of the string as 'to_string()' provides it.
                 return ret_val<void>::make_failure( _( "You need %s" ), qual.to_string() );
             }

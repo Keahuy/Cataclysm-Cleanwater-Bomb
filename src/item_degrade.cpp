@@ -2,8 +2,6 @@
 * For item damage, durability, degradation, age, rot
 */
 
-#include "item.h"
-
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
@@ -25,7 +23,6 @@
 #include "bodypart.h"
 #include "cached_options.h"
 #include "calendar.h"
-#include "catalua_ui.h"
 #include "character.h"
 #include "color.h"
 #include "coordinates.h"
@@ -39,6 +36,7 @@
 #include "game.h"
 #include "game_constants.h"
 #include "generic_factory.h"
+#include "item.h"
 #include "item_category.h"
 #include "item_components.h"
 #include "item_contents.h"
@@ -51,6 +49,7 @@
 #include "messages.h"
 #include "mtype.h"
 #include "options.h"
+#include "recipe.h"
 #include "rng.h"
 #include "string_formatter.h"
 #include "translations.h"
@@ -106,7 +105,7 @@ static const item *get_most_rotten_component( const item &craft )
 {
     const item *most_rotten = nullptr;
     for( const item_components::type_vector_pair &tvp : craft.components ) {
-        if( !tvp.second.front().goes_bad() ) {
+        if( !tvp.second.front().goes_bad() || !tvp.second.front().is_comestible() ) {
             // they're all the same type, so this should be the same for all
             continue;
         }
@@ -119,12 +118,78 @@ static const item *get_most_rotten_component( const item &craft )
     return most_rotten;
 }
 
+static constexpr double ROT_SEED_MASS_MULT = 10.0;
+// Against the seed multiplier above, the bad-mass-fraction floor only overtakes the
+// weighted blend once the most rotten component is several times worse than the
+// going-bad average, i.e. when it is near fully rotten (relative rot above 1.8).
+static constexpr double PRESERVE_FLOOR_COEFF = 5.0;
+
+namespace
+{
+struct component_rot_blend {
+    double weighted_rot = 0.0;
+    // Mass fraction of going-bad components among all spoiling components.
+    double bad_mass_fraction = 0.0;
+};
+} // namespace
+
+// Mass-weighted average relative rot of spoiling comestible components.  Components
+// at or past the going-bad threshold contribute extra weight: microbes from a bad
+// piece seed the whole batch, so dilution helps at large scale but a small batch
+// with a bad piece stays nearly as bad as that piece.
+static std::optional<component_rot_blend> get_mass_weighted_rot( const item &craft )
+{
+    component_rot_blend blend;
+    double total_weight = 0.0;
+    double bad_weight = 0.0;
+    for( const item_components::type_vector_pair &tvp : craft.components ) {
+        if( !tvp.second.front().goes_bad() || !tvp.second.front().is_comestible() ) {
+            // they're all the same type, so this should be the same for all
+            continue;
+        }
+        for( const item &it : tvp.second ) {
+            const double weight = units::to_milligram<int64_t>( it.weight() );
+            if( weight <= 0.0 ) {
+                continue;
+            }
+            const bool going_bad = it.is_going_bad();
+            const double seed_mult = going_bad ? ROT_SEED_MASS_MULT : 1.0;
+            blend.weighted_rot += it.get_relative_rot() * weight * seed_mult;
+            total_weight += weight * seed_mult;
+            if( going_bad ) {
+                bad_weight += weight;
+            }
+        }
+    }
+    if( total_weight <= 0.0 ) {
+        return std::nullopt;
+    }
+    blend.weighted_rot /= total_weight;
+    blend.bad_mass_fraction = bad_weight / total_weight;
+    return blend;
+}
+
+double item::max_components_relative_rot() const
+{
+    double max_rot = 0.0;
+    for( const item_components::type_vector_pair &tvp : components ) {
+        if( !tvp.second.front().goes_bad() || !tvp.second.front().is_comestible() ) {
+            // they're all the same type, so this should be the same for all
+            continue;
+        }
+        for( const item &it : tvp.second ) {
+            max_rot = std::max( max_rot, it.get_relative_rot() );
+        }
+    }
+    return max_rot;
+}
+
 static time_duration get_shortest_lifespan_from_components( const item &craft )
 {
     const item *shortest_lifespan_component = nullptr;
     time_duration shortest_lifespan = 0_turns;
     for( const item_components::type_vector_pair &tvp : craft.components ) {
-        if( !tvp.second.front().goes_bad() ) {
+        if( !tvp.second.front().goes_bad() || !tvp.second.front().is_comestible() ) {
             // they're all the same type, so this should be the same for all
             continue;
         }
@@ -156,20 +221,46 @@ static bool shelf_life_less_than_each_component( const item &craft )
     return true;
 }
 
-// There are two ways rot is inherited:
-// 1) Inherit the remaining lifespan of the component with the lowest remaining lifespan
-// 2) Inherit the relative rot of the component with the highest relative rot
-//
-// Method 1 is used when the result of the recipe has a lower maximum shelf life than all of
-// its component's maximum shelf lives. Relative rot is not good to inherit in this case because
-// it can make an extremely short resultant remaining lifespan on the product.
-//
-// Method 2 is used when any component has a longer maximum shelf life than the result does.
-// Inheriting the lowest remaining lifespan can not be used in this case because it would break
-// food preservation recipes.
+// Rot inheritance modes:
+// 1) Shortest remaining lifespan of the components, used when the result has a lower
+//    maximum shelf life than all of its components: a short-lived mix goes bad with
+//    its worst part.
+// 2) Relative rot of the most rotten component, used otherwise: heavily rotten
+//    components can never be turned into fresh long-shelf-life products.
+// Cooked results (heated result or non-raw result) blend component rot by mass
+// instead, floored at PRESERVE_FLOOR_COEFF times the most rotten component's rot
+// scaled by the bad mass fraction: a small batch with a bad piece stays nearly as
+// bad as that piece, while large batches dilute it.  The floor only overtakes the
+// weighted blend for near fully rotten components, i.e. once the most rotten
+// component exceeds the seed multiplier / floor coefficient times the going-bad
+// average.
+// An explicit "rot_inherit" recipe setting overrides the automatic choice;
+// "fresh" skips inheritance entirely so the in-progress craft does not rot.
 void item::inherit_rot_from_components( item &it )
 {
-    if( shelf_life_less_than_each_component( it ) ) {
+    rot_inherit_mode mode = rot_inherit_mode::MAX;
+    if( it.is_craft() && it.craft_data_ && it.craft_data_->making ) {
+        mode = it.craft_data_->making->get_rot_inherit();
+        if( mode == rot_inherit_mode::DEFAULT && !it.craft_data_->disassembly ) {
+            const recipe &making = *it.craft_data_->making;
+            if( making.hot_result() || making.removes_raw() ) {
+                mode = rot_inherit_mode::PRESERVE_BLEND;
+            }
+        }
+    }
+    if( mode == rot_inherit_mode::FRESH ) {
+        return;
+    }
+
+    if( mode == rot_inherit_mode::SHORTEST ) {
+        const time_duration shortest_lifespan = get_shortest_lifespan_from_components( it );
+        if( shortest_lifespan > 0_turns ) {
+            it.set_rot( std::max( 0_turns, it.get_shelf_life() - shortest_lifespan ) );
+            return;
+        }
+        // Fallthrough: all components are rotten
+    } else if( mode == rot_inherit_mode::DEFAULT &&
+               shelf_life_less_than_each_component( it ) ) {
         const time_duration shortest_lifespan = get_shortest_lifespan_from_components( it );
         if( shortest_lifespan > 0_turns && shortest_lifespan < it.get_shelf_life() ) {
             it.set_rot( it.get_shelf_life() - shortest_lifespan );
@@ -179,8 +270,32 @@ void item::inherit_rot_from_components( item &it )
     }
 
     const item *most_rotten = get_most_rotten_component( it );
-    if( most_rotten ) {
-        it.set_relative_rot( most_rotten->get_relative_rot() );
+    const double max_rot = most_rotten ? most_rotten->get_relative_rot() : 0.0;
+    switch( mode ) {
+        case rot_inherit_mode::SHORTEST:
+        case rot_inherit_mode::MAX:
+        default:
+            if( most_rotten ) {
+                it.set_relative_rot( max_rot );
+            }
+            break;
+        case rot_inherit_mode::WEIGHTED:
+        case rot_inherit_mode::PRESERVE_BLEND: {
+            const std::optional<component_rot_blend> blend = get_mass_weighted_rot( it );
+            if( blend ) {
+                const double blended = mode == rot_inherit_mode::PRESERVE_BLEND ?
+                                       std::max( blend->weighted_rot,
+                                                 PRESERVE_FLOOR_COEFF * max_rot *
+                                                 blend->bad_mass_fraction ) :
+                                       blend->weighted_rot;
+                it.set_relative_rot( blended );
+            } else if( most_rotten ) {
+                it.set_relative_rot( max_rot );
+            }
+            break;
+        }
+        case rot_inherit_mode::FRESH:
+            break;
     }
 }
 
@@ -363,10 +478,42 @@ bool item::can_have_fault( const fault_id &f_id )
     return true;
 }
 
-bool item::set_fault( const fault_id &f_id, bool force, const Character *holder )
+namespace
+{
+constexpr float FAULT_RATE_UNBREAKABLE = 0.25f;
+constexpr float FAULT_RATE_STURDY = 0.5f;
+constexpr float FAULT_RATE_FRAGILE_MELEE = 1.25f;
+constexpr float DURABLE_DAMAGE_MULT = 0.25f;
+
+float fault_rate_multiplier( const item &it )
+{
+    float protective = 1.0f;
+    float adverse = 1.0f;
+    if( it.has_flag( flag_UNBREAKABLE ) || it.has_flag( flag_UNBREAKABLE_MELEE ) ) {
+        protective = std::min( protective, FAULT_RATE_UNBREAKABLE );
+    }
+    if( it.has_flag( flag_STURDY ) || it.has_flag( flag_DURABLE_MELEE ) ||
+        it.has_flag( flag_DURABLE ) ) {
+        protective = std::min( protective, FAULT_RATE_STURDY );
+    }
+    if( it.has_flag( flag_FRAGILE_MELEE ) ) {
+        adverse = std::max( adverse, FAULT_RATE_FRAGILE_MELEE );
+    }
+    return protective * adverse;
+}
+} // namespace
+
+bool item::set_fault( const fault_id &f_id, bool force, const Character *holder,
+                      bool skip_rate_mult )
 {
     if( !force && !can_have_fault( f_id ) ) {
         return false;
+    }
+    if( !skip_rate_mult ) {
+        const float mult = fault_rate_multiplier( *this );
+        if( mult < 1.0f && !x_in_y( mult, 1.0 ) ) {
+            return false;
+        }
     }
 
     // if f_id fault blocks fault A, we should remove fault A before applying fault f_id
@@ -388,23 +535,34 @@ bool item::set_fault( const fault_id &f_id, bool force, const Character *holder 
 }
 
 void item::set_random_fault_of_type( const std::string &fault_type, bool force,
-                                     const Character *holder )
+                                     const Character *holder, bool skip_rate_mult )
 {
     if( force ) {
-        set_fault( random_entry( faults::all_of_type( fault_type ) ), true, holder );
+        set_fault( random_entry( faults::all_of_type( fault_type ) ), true, holder,
+                   skip_rate_mult );
         return;
     }
 
     weighted_int_list<fault_id> faults_by_type;
+    // Fresh items (damage_level 0, e.g. crafting defect rolls) draw from the full
+    // pool; higher severities unlock as the item takes further damage.
+    const int lvl = damage_level();
+    fault_severity max_allowed = fault_severity::critical;
+    if( lvl == 1 ) {
+        max_allowed = fault_severity::minor;
+    } else if( lvl == 2 ) {
+        max_allowed = fault_severity::major;
+    }
     for( const std::pair<fault_id, int> &f : type->faults ) {
-        if( f.first.obj().type() == fault_type && can_have_fault( f.first ) ) {
+        if( f.first.obj().type() == fault_type && can_have_fault( f.first ) &&
+            f.first->severity() <= max_allowed ) {
             faults_by_type.add( f.first, f.second );
         }
 
     }
 
     if( !faults_by_type.empty() ) {
-        set_fault( *faults_by_type.pick(), force, holder );
+        set_fault( *faults_by_type.pick(), force, holder, skip_rate_mult );
     }
 
 }
@@ -876,6 +1034,9 @@ bool item::mod_damage( int qty, const Character *holder )
     if( has_flag( flag_UNBREAKABLE ) ) {
         return false;
     }
+    if( has_flag( flag_DURABLE ) && qty > 0 ) {
+        qty = std::max( static_cast<int>( qty * DURABLE_DAMAGE_MULT ), 1 );
+    }
     if( max_damage() == 0 ) {
         // Items with no damage range (ammo, liquid/gas comestibles) lose units
         // when damaged instead of accumulating damage. Stackable resources have
@@ -883,42 +1044,12 @@ bool item::mod_damage( int qty, const Character *holder )
         // so the whole stack shares a single damage value.
         charges -= std::min( type->stack_size * qty / itype::damage_scale, charges );
         const bool destroy = charges == 0;
-        if( destroy ) {
-            cata::lua_ui::dispatch_native_callback(
-            "iequippable", typeId().str(), "on_break", {
-                { "character", static_cast<const Character *>( holder ) },
-                { "item", static_cast<const item *>( this ) }
-            } );
-        }
         return destroy; // return destroy = true if no charges
     } else {
         const int dmg_before = damage_;
         const bool destroy = ( damage_ + qty ) > max_damage();
         force_set_damage( damage_ + qty );
         if( damage_ != dmg_before ) {
-            const cata::lua_ui::native_callback_arguments payload = {
-                { "character", static_cast<const Character *>( holder ) },
-                { "item", static_cast<const item *>( this ) },
-                { "old_damage", std::int64_t { dmg_before } },
-                { "new_damage", std::int64_t { damage_ } },
-                { "delta", std::int64_t { damage_ - dmg_before } }
-            };
-            cata::lua_ui::dispatch_native_callback(
-                "iequippable", typeId().str(),
-                "on_durability_change", payload );
-            if( damage_ < dmg_before ) {
-                cata::lua_ui::dispatch_native_callback(
-                    "iequippable", typeId().str(), "on_repair", payload );
-            }
-        }
-        if( destroy ) {
-            cata::lua_ui::dispatch_native_callback(
-            "iequippable", typeId().str(), "on_break", {
-                { "character", static_cast<const Character *>( holder ) },
-                { "item", static_cast<const item *>( this ) },
-                { "old_damage", std::int64_t { dmg_before } },
-                { "new_damage", std::int64_t { damage_ } }
-            } );
         }
 
         if( qty > 0 && !destroy && ( get_category_shallow().get_id() != item_category_veh_parts ||
@@ -928,7 +1059,7 @@ bool item::mod_damage( int qty, const Character *holder )
 
         // TODO: think about better way to telling the game what faults should be applied when
         if( qty > 0 ) {
-            for( int i = 0; i <= qty; i += itype::damage_scale ) {
+            for( int i = 0; i < qty; i += itype::damage_scale ) {
                 set_random_fault_of_type( "mechanical_damage", false, holder );
             }
         }

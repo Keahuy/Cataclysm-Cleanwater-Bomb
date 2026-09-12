@@ -2,6 +2,26 @@ name: Lua public contract
 
 on:
   pull_request:
+    paths:
+      - '.github/workflows/lua-contract.yml'
+      - 'ai/docs-impact.yml'
+      - 'ai/generated-files.yml'
+      - 'ai/test-matrix.yml'
+      - 'data/lua/**'
+      - 'src/CMakeLists.txt'
+      - 'src/lua/CMakeLists.txt'
+      - 'src/init.cpp'
+      - 'src/main.cpp'
+      - 'src/sol/config.hpp'
+      - 'src/lua_platform*.cpp'
+      - 'src/lua_platform*.h'
+      - 'src/event.h'
+      - 'tools/lua_api/**'
+      - 'tools/create_lua_mod.py'
+      - 'tools/test_create_lua_mod.py'
+      - 'tools/migrate_lua_first.py'
+      - 'tools/test_migrate_lua_first.py'
+      - 'tools/test_lua_mutation_migration.py'
   push:
     branches: [ master ]
     paths:
@@ -12,10 +32,18 @@ on:
       - 'data/lua/**'
       - 'src/CMakeLists.txt'
       - 'src/lua/CMakeLists.txt'
-      - 'src/catalua*.cpp'
-      - 'src/catalua*.h'
+      - 'src/init.cpp'
+      - 'src/main.cpp'
+      - 'src/sol/config.hpp'
+      - 'src/lua_platform*.cpp'
+      - 'src/lua_platform*.h'
       - 'src/event.h'
       - 'tools/lua_api/**'
+      - 'tools/create_lua_mod.py'
+      - 'tools/test_create_lua_mod.py'
+      - 'tools/migrate_lua_first.py'
+      - 'tools/test_migrate_lua_first.py'
+      - 'tools/test_lua_mutation_migration.py'
   workflow_dispatch:
 
 permissions:
@@ -34,54 +62,34 @@ jobs:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0
           persist-credentials: false
 
-      - name: Detect public-contract changes
-        id: detect
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          if [ "$EVENT_NAME" != "pull_request" ]; then
-            echo "required=true" >> "$GITHUB_OUTPUT"
-          elif git diff --quiet "$BASE_SHA" "$HEAD_SHA" -- \
-            '.github/workflows/lua-contract.yml' \
-            'ai/docs-impact.yml' \
-            'ai/generated-files.yml' \
-            'ai/test-matrix.yml' \
-            ':(glob)data/lua/**' \
-            'src/CMakeLists.txt' \
-            'src/lua/CMakeLists.txt' \
-            'src/main.cpp' \
-            ':(glob)src/catalua*.cpp' \
-            ':(glob)src/catalua*.h' \
-            'src/event.h' \
-            ':(glob)tools/lua_api/**'; then
-            echo "required=false" >> "$GITHUB_OUTPUT"
-          else
-            diff_status=$?
-            if [ "$diff_status" -ne 1 ]; then
-              exit "$diff_status"
-            fi
-            echo "required=true" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Install pinned validation dependencies
-        if: steps.detect.outputs.required == 'true'
         run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends lua5.4
           python3 -m pip install --disable-pip-version-check -r tools/lua_api/requirements.txt
 
-      - name: Validate Lua v5 declarations and generated contract
-        if: steps.detect.outputs.required == 'true'
+      - name: Validate Lua-first Platform declarations and contracts
+        # Includes live repository checks for all five contracts and negative cases.
         run: |
-          python3 tools/lua_api/check_luals_declarations.py
-          python3 tools/lua_api/check_ccb_inventory.py
-          python3 tools/lua_api/generate_public_contract.py --check
-          python3 tools/lua_api/check_public_contract.py
-          python3 tools/lua_api/check_examples.py --require-luac
-          python3 tools/lua_api/check_cmake_contract.py
           python3 -m unittest discover -s tools/lua_api -p 'test_*.py'
+
+      - name: Validate Lua-first migration semantics
+        run: |
+          if ! command -v lua >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y lua5.4
+          fi
+          python3 tools/test_migrate_lua_first.py
+
+      - name: Validate Mod scaffolds and editor diagnostics
+        env:
+          CCB_LUALS: ${{ runner.temp }}/ccb-luals/bin/lua-language-server
+        run: |
+          curl --fail --location --retry 3 --silent --show-error \
+            https://github.com/LuaLS/lua-language-server/releases/download/3.19.1/lua-language-server-3.19.1-linux-x64.tar.gz \
+            -o "${RUNNER_TEMP}/ccb-luals.tar.gz"
+          echo "e9235d2d72ef55bc41cf8c99cda2ed64777682024b4bb81f5dea425060c5cbb8  ${RUNNER_TEMP}/ccb-luals.tar.gz" | sha256sum --check
+          mkdir -p "${RUNNER_TEMP}/ccb-luals"
+          tar -xzf "${RUNNER_TEMP}/ccb-luals.tar.gz" -C "${RUNNER_TEMP}/ccb-luals"
+          python3 tools/test_create_lua_mod.py
+          python3 -m unittest discover -s tools/lua_api -p 'test_mod_sdk.py' -k LuaLanguageServerIntegrationTest

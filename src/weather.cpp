@@ -1,5 +1,9 @@
 #include "weather.h"
 
+#include <color.h>
+#include <pimpl.h>
+#include <type_id.h>
+#include <weather_type.h>
 #include <algorithm>
 #include <array>
 #include <climits>
@@ -15,7 +19,6 @@
 #include "calendar.h"
 #include "character.h"
 #include "character_attire.h"
-#include "catalua_ui.h"
 #include "city.h"
 #include "coordinates.h"
 #include "creature.h"
@@ -28,6 +31,7 @@
 #include "item_location.h"
 #include "itype.h"
 #include "line.h"
+#include "lua_platform_hooks.h"
 #include "map.h"
 #include "map_scale_constants.h"
 #include "mapdata.h"
@@ -401,10 +405,6 @@ void wet_character( Character &target, int amount )
     // Coarse correction to get us back to previously intended soaking rate.
     if( !calendar::once_every( 6_seconds ) ) {
         return;
-    }
-    std::map<bodypart_id, std::vector<const item *>> clothing_map;
-    for( const bodypart_id &bp : target.get_all_body_parts() ) {
-        clothing_map.emplace( bp, std::vector<const item *>() );
     }
     std::map<bodypart_id, int> warmth_bp = target.worn.warmth( target );
     const int warmth_delay = warmth_bp[body_part_torso] * 0.8 +
@@ -1082,13 +1082,13 @@ void weather_manager::update_weather()
         }
         if( old_weather != WEATHER_NULL ) {
             if( weather_changed ) {
-                cata::lua_ui::dispatch_native_hook(
+                cata::lua_platform::dispatch_native_hook(
                 "on_weather_changed", {
                     { "before", old_weather.str() },
                     { "after", weather_id.str() }
                 } );
             }
-            cata::lua_ui::dispatch_native_hook(
+            cata::lua_platform::dispatch_native_hook(
             "on_weather_updated", {
                 { "weather", weather_id.str() },
                 {

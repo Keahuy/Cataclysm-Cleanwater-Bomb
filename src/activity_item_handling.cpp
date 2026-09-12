@@ -1,12 +1,14 @@
 #include "activity_handlers.h" // IWYU pragma: associated
 #include "activity_item_handling.h" // IWYU pragma: associated
 
+#include <line.h>
+#include <type_id.h>
 #include <algorithm>
 #include <array>
 #include <climits>
 #include <cmath>
-#include <deque>
 #include <cstdlib>
+#include <deque>
 #include <list>
 #include <memory>
 #include <optional>
@@ -762,7 +764,13 @@ static void move_item( Character &you, item &it, const int quantity, const tripo
         if( activity_to_restore == ACT_FETCH_REQUIRED ) {
             it.set_var( "activity_var", you.name );
         }
-        put_into_vehicle_or_drop( you, item_drop_reason::deliberate, { it }, &here, dest );
+        const std::vector<item_location> moved = put_into_vehicle_or_drop_ret_locs(
+                you, item_drop_reason::deliberate, { it }, &here, dest );
+        if( activity_to_restore == ACT_FETCH_REQUIRED ) {
+            for( const item_location &loc : moved ) {
+                activity_handlers::reserve_activity_item( you, loc );
+            }
+        }
         // Remove from map or vehicle.
         if( vpr_src ) {
             vpr_src->vehicle().remove_item( vpr_src->part(), &it );
@@ -1414,9 +1422,17 @@ std::optional<bool> unload_item( Character &you, const tripoint_abs_ms &src,
                     if( mod->is_irremovable() ) {
                         continue;
                     }
-                    you.gunmod_remove( *it, *mod );
-                    // need to return so the remove gunmod activity starts
-                    return std::nullopt;
+                    const item_location gun_loc = vpr_src ?
+                                                  item_location( vehicle_cursor( vpr_src->vehicle(), vpr_src->part_index() ), it ) :
+                                                  item_location( map_cursor( src_bub ), it );
+                    // Keep the zone activity in the backlog while the removable
+                    // mod is processed, including its viewport and tile progress.
+                    const bool was_auto_resume = you.activity.auto_resume;
+                    you.activity.auto_resume = true;
+                    if( you.gunmod_remove( gun_loc, *mod ) ) {
+                        return std::nullopt;
+                    }
+                    you.activity.auto_resume = was_auto_resume;
                 }
             }
 
@@ -1994,7 +2010,7 @@ bool are_requirements_nearby(
             }
         }
     }
-    return needed_things.obj().can_make_with_inventory( temp_inv, is_crafting_component );
+    return needed_things.obj().can_make_with_inventory( &you, temp_inv, is_crafting_component );
 }
 
 } //namespace multi_activity_actor
@@ -2102,7 +2118,7 @@ activity_reason_info multi_vehicle_deconstruct_activity_actor::multi_activity_ca
         const requirement_data &reqs = vpinfo.removal_requirements();
         const inventory &inv = you.crafting_inventory( false );
 
-        const bool can_make = reqs.can_make_with_inventory( inv, is_crafting_component );
+        const bool can_make = reqs.can_make_with_inventory( &you, inv, is_crafting_component );
         you.set_value( "veh_index_type", vpinfo.name() );
         // temporarily store the intended index, we do this so two NPCs don't try and work on the same part at same time.
         you.activity_vehicle_part_index = vpindex;
@@ -2161,7 +2177,7 @@ activity_reason_info multi_vehicle_repair_activity_actor::multi_activity_can_do(
         const requirement_data &reqs = vpinfo.repair_requirements();
         const inventory &inv =
             you.crafting_inventory( src_loc, pickup_range - 1, false );
-        const bool can_make = reqs.can_make_with_inventory( inv, is_crafting_component );
+        const bool can_make = reqs.can_make_with_inventory( &you, inv, is_crafting_component );
         you.set_value( "veh_index_type", vpinfo.name() );
         // temporarily store the intended index, we do this so two NPCs don't try and work on the same part at same time.
         you.activity_vehicle_part_index = vpindex;
@@ -2284,10 +2300,8 @@ activity_reason_info multi_butchery_activity_actor::multi_activity_can_do( Chara
     if( !corpses.empty() ) {
         for( item &body : corpses ) {
             const mtype &corpse = *body.get_mtype();
-            for( species_id species : corpse.species ) {
-                if( you.empathizes_with_species( species ) ) {
-                    return activity_reason_info::fail( do_activity_reason::REFUSES_THIS_WORK );
-                }
+            if( character_has_butchery_empathy( you, corpse.id ) ) {
+                return activity_reason_info::fail( do_activity_reason::REFUSES_THIS_WORK );
             }
         }
         if( big_count > 0 && small_count == 0 ) {
@@ -2341,7 +2355,7 @@ activity_reason_info multi_study_activity_actor::multi_activity_can_do( Characte
 
     item_location book = find_study_book( abspos, you );
     if( book ) {
-        book->set_var( "activity_var", you.name );
+        activity_handlers::reserve_activity_item( you, book );
         return activity_reason_info::ok( do_activity_reason::NEEDS_BOOK_TO_LEARN );
     }
 
@@ -2542,7 +2556,7 @@ activity_reason_info multi_craft_activity_actor::multi_activity_can_do( Characte
                 tool_comp_vector = r.simple_requirements().get_tools();
             }
             requirement_data req = requirement_data( tool_comp_vector, quality_comp_vector, item_comp_vector );
-            if( req.can_make_with_inventory( inv, is_crafting_component ) ) {
+            if( req.can_make_with_inventory( &you, inv, is_crafting_component ) ) {
                 return activity_reason_info::ok( do_activity_reason::NEEDS_CRAFT );
             } else {
                 return activity_reason_info( do_activity_reason::NEEDS_CRAFT, false, req );
@@ -2573,24 +2587,24 @@ activity_reason_info multi_disassemble_activity_actor::multi_activity_can_do( Ch
                               i.components.only_item().typeId() : i.typeId() );
             req = r.disassembly_requirements();
             if( !std::all_of( req.get_qualities().begin(),
-            req.get_qualities().end(), [&inv]( const std::vector<quality_requirement> &cur ) {
+            req.get_qualities().end(), [&inv, &you]( const std::vector<quality_requirement> &cur ) {
             return cur.empty() ||
-                std::any_of( cur.begin(), cur.end(), [&inv]( const quality_requirement & curr ) {
-                    return curr.has( inv, return_true<item> );
+                std::any_of( cur.begin(), cur.end(), [&inv, &you]( const quality_requirement & curr ) {
+                    return curr.has( &you, inv, return_true<item> );
                 } );
             } ) ) {
                 continue;
             }
             if( !std::all_of( req.get_tools().begin(),
-            req.get_tools().end(), [&inv]( const std::vector<tool_comp> &cur ) {
-            return cur.empty() || std::any_of( cur.begin(), cur.end(), [&inv]( const tool_comp & curr ) {
-                    return  curr.has( inv, return_true<item> );
+            req.get_tools().end(), [&inv, &you]( const std::vector<tool_comp> &cur ) {
+            return cur.empty() || std::any_of( cur.begin(), cur.end(), [&inv, &you]( const tool_comp & curr ) {
+                    return  curr.has( &you, inv, return_true<item> );
                 } );
             } ) ) {
                 continue;
             }
             // check passed, mark the item
-            i.set_var( "activity_var", you.name );
+            activity_handlers::reserve_activity_item( you, item_location( map_cursor( src_loc ), &i ) );
             return activity_reason_info::ok( do_activity_reason::NEEDS_DISASSEMBLE );
         }
     }
@@ -2857,10 +2871,9 @@ std::optional<requirement_id> multi_farm_activity_actor::multi_activity_requirem
 
     if( reason == do_activity_reason::NEEDS_TILLING ) {
         return requirement_data_multi_farm_tilling;
-    } else if( reason == do_activity_reason::NEEDS_WATERING ) {
-        // no requirements, water is consumed directly by the action
-    } else if( reason == do_activity_reason::NEEDS_FERTILIZING ) {
-        // no requirements
+    } else if( reason == do_activity_reason::NEEDS_WATERING ||
+               reason == do_activity_reason::NEEDS_FERTILIZING ) {
+        // no requirements, water is consumed directly by the action or fertilizer is used directly
     } else if( reason == do_activity_reason::NEEDS_PLANTING ) {
         // we can't hardcode individual seed types in JSON, so make a custom requirement
         requirement_data::alter_item_comp_vector requirement_comp_vector = { {
@@ -3357,7 +3370,7 @@ bool fetch_required_activity_actor::fetch_activity(
                         leftovers.charges = 0;
                     }
                     it.set_var( "activity_var", you.name );
-                    you.i_add( it );
+                    activity_handlers::reserve_activity_item( you, you.i_add( it ) );
                     if( you.is_npc() ) {
                         if( pickup_count == 1 ) {
                             const std::string item_name = it.tname();
@@ -3398,8 +3411,8 @@ static bool butcher_corpse_activity( Character &you, const tripoint_bub_ms &src_
             if( corpse.size > creature_size::medium && reason != do_activity_reason::NEEDS_BIG_BUTCHERING ) {
                 continue;
             }
-            elem.set_var( "activity_var", you.name );
             item_location corpse_loc = item_location( map_cursor( src_loc ), &elem );
+            activity_handlers::reserve_activity_item( you, corpse_loc );
             bd.emplace_back( corpse_loc, butcher_type::FULL );
         }
     }
@@ -3908,8 +3921,7 @@ bool multi_study_activity_actor::multi_activity_do( Character &you,
     if( reason == do_activity_reason::NEEDS_BOOK_TO_LEARN ) {
         item_location book_loc = find_study_book( src, you );
         if( book_loc ) {
-            book_loc->set_var( "activity_var", you.name );
-            you.may_activity_occupancy_after_end_items_loc.push_back( book_loc );
+            activity_handlers::reserve_activity_item( you, book_loc );
             const time_duration time_taken = you.time_to_read( *book_loc, you );
             item_location ereader;
             you.assign_activity( read_activity_actor( time_taken, book_loc, ereader, true ) );
@@ -4592,6 +4604,18 @@ bool try_fuel_fire( Character &you, std::optional<tripoint_bub_ms> fire_target )
         }
     }
     return true;
+}
+
+void activity_handlers::reserve_activity_item( Character &you, item_location loc )
+{
+    if( !loc ) {
+        return;
+    }
+    loc.get_item()->set_var( "activity_var", you.name );
+    auto &reserved = you.may_activity_occupancy_after_end_items_loc;
+    if( std::find( reserved.begin(), reserved.end(), loc ) == reserved.end() ) {
+        reserved.push_back( loc );
+    }
 }
 
 void activity_handlers::clean_may_activity_occupancy_items_var_if_is_avatar_and_no_activity_now(

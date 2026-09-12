@@ -1,5 +1,6 @@
 #include "pickup.h"
 
+#include <coordinates.h>
 #include <algorithm>
 #include <array>
 #include <functional>
@@ -34,8 +35,8 @@
 #include "mapdata.h"
 #include "math_parser_diag_value.h"
 #include "messages.h"
-#include "overmapbuffer.h"
 #include "options.h"
+#include "overmapbuffer.h"
 #include "pimpl.h"
 #include "player_activity.h"
 #include "point.h"
@@ -218,11 +219,10 @@ static bool pick_one_up( item_location &loc, int quantity, bool &got_water, bool
     //new item (copy)
     item newit = it;
 
-    // Clear activity_var if it differs from the picker's name
-    if( it.has_var( "activity_var" ) && it.get_var( "activity_var", "" ) != player_character.name ) {
-        it.erase_var( "activity_var" );
-        newit.erase_var( "activity_var" );
-    }
+    // The picked-up copy no longer belongs to the reservation at this location.
+    // Also release orphaned marks from older activities, including our own.
+    // Leave the source unchanged if pickup is cancelled or only takes a portion.
+    newit.erase_var( "activity_var" );
     if( !newit.is_owned_by( player_character, true ) ) {
         const std::string thief_mode = player_character.get_value( "THIEF_MODE" ).str();
         if( thief_mode == "THIEF_HONEST" ) {
@@ -538,6 +538,7 @@ void Pickup::pick_info::serialize( JsonOut &jsout ) const
     jsout.member( "src_pos", src_pos );
     jsout.member( "src_container", src_container );
     jsout.member( "dst", dst );
+    jsout.member( "highlight", highlight );
     jsout.member( "extra_moves_per_distance", extra_moves_per_distance );
     jsout.member( "picked_up_volume", picked_up_volume );
     jsout.member( "max_volume", max_volume );
@@ -555,6 +556,7 @@ void Pickup::pick_info::deserialize( const JsonObject &jsobj )
     jsobj.read( "src_pos", src_pos );
     jsobj.read( "src_container", src_container );
     jsobj.read( "dst", dst );
+    jsobj.read( "highlight", highlight );
     jsobj.read( "extra_moves_per_distance", extra_moves_per_distance );
     jsobj.read( "picked_up_volume", picked_up_volume );
     jsobj.read( "max_volume", max_volume );

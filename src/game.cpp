@@ -69,8 +69,9 @@
 #include "cata_scope_helpers.h"
 #include "cata_utility.h"
 #include "cata_variant.h"
-#include "catalua_platform.h"
-#include "catalua_ui.h"
+#include "lua_platform_loader.h"
+#include "lua_platform_runtime.h"
+#include "lua_platform_hooks.h"
 #include "catacharset.h"
 #include "character.h"
 #include "character_attire.h"
@@ -482,6 +483,8 @@ game::game() :
     next_npc_id( 1 ),
     next_mission_id( 1 ),
     next_item_uid( 1 ),
+    next_monster_uid( 1 ),
+    next_vehicle_uid( 1 ),
     remoteveh_cache_time( calendar::before_time_starts ),
     last_mouse_edge_scroll( std::chrono::steady_clock::now() ),
     dimension_prefix( dimension_world_default )
@@ -515,9 +518,6 @@ game::~game()
         android_hud::clear_snapshot();
     }
 #endif
-    if constexpr( cata::lua_ui::is_enabled() ) {
-        cata::lua_ui::shutdown();
-    }
     cata::lua_platform::shutdown();
     // event_bus_ptr about to die; let debug_capture drop its sticky
     // subscribe flag and release the JSONL file. Without this, a later
@@ -746,6 +746,8 @@ void game::reset_game_state()
     next_npc_id = character_id( 1 );
     next_mission_id = 1;
     next_item_uid = 1;
+    next_monster_uid = 1;
+    next_vehicle_uid = 1;
     uquit = QUIT_NO;   // We haven't quit the game
     bVMonsterLookFire = true;
 
@@ -1165,10 +1167,6 @@ bool game::start_game()
     if constexpr( cata::lua_platform::is_enabled() ) {
         cata::lua_platform::on_world_ready( true );
     }
-    if constexpr( cata::lua_ui::is_enabled() ) {
-        cata::lua_ui::on_world_ready(
-            cata::lua_ui::world_ready_kind::new_game );
-    }
     get_event_bus().send<event_type::game_start>( getVersionString() );
     get_event_bus().send<event_type::game_avatar_new>( /*is_new_game=*/true, /*is_debug=*/false,
             u.getID(), u.name, u.custom_profession );
@@ -1444,7 +1442,7 @@ void game::create_starting_npcs()
     //One random starting NPC mission
     tmp->add_new_mission( mission::reserve_random( ORIGIN_OPENER_NPC, tmp->pos_abs_omt(),
                           tmp->getID() ) );
-    cata::lua_ui::dispatch_native_npc_spawn( *tmp, "starting" );
+    cata::lua_platform::dispatch_native_npc_spawn( *tmp, "starting" );
 }
 
 static int veh_lumi( vehicle &veh )
@@ -2592,6 +2590,9 @@ std::pair<tripoint_rel_ms, tripoint_rel_ms> game::mouse_edge_scrolling( input_co
     ( void ) speed;
     ( void ) iso;
 #if !defined(TUI)
+    if( !is_mouse_active_for_edge_scrolling() ) {
+        return std::make_pair( tripoint_rel_ms::zero, tripoint_rel_ms::zero );
+    }
     std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
     if( now < last_mouse_edge_scroll + std::chrono::milliseconds( rate ) ) {
         return ret;
@@ -3148,6 +3149,10 @@ bool game::is_game_over()
     }
     // is_dead_state() already checks hp_torso && hp_head, no need to for loop it
     if( u.is_dead_state() ) {
+        cata::lua_platform::dispatch_avatar_fatal( u, u.get_killer() );
+        if( !u.is_dead_state() ) {
+            return false;
+        }
         effect_on_conditions::prevent_death();
         if( !u.is_dead_state() ) {
             return false;
@@ -3991,6 +3996,56 @@ int64_t game::assign_item_uid()
     return next_item_uid++;
 }
 
+int64_t game::assign_monster_uid()
+{
+    if( next_monster_uid <= 0 ) {
+        next_monster_uid = 1;
+    }
+    if( next_monster_uid == std::numeric_limits<int64_t>::max() ) {
+        return 0;
+    }
+    return next_monster_uid++;
+}
+
+void game::observe_monster_uid( const int64_t uid )
+{
+    if( uid <= 0 ) {
+        return;
+    }
+
+    constexpr int64_t max_uid = std::numeric_limits<int64_t>::max();
+    if( uid == max_uid ) {
+        next_monster_uid = max_uid;
+    } else {
+        next_monster_uid = std::max( next_monster_uid, uid + 1 );
+    }
+}
+
+int64_t game::assign_vehicle_uid()
+{
+    if( next_vehicle_uid <= 0 ) {
+        next_vehicle_uid = 1;
+    }
+    if( next_vehicle_uid == std::numeric_limits<int64_t>::max() ) {
+        return 0;
+    }
+    return next_vehicle_uid++;
+}
+
+void game::observe_vehicle_uid( const int64_t uid )
+{
+    if( uid <= 0 ) {
+        return;
+    }
+
+    constexpr int64_t max_uid = std::numeric_limits<int64_t>::max();
+    if( uid == max_uid ) {
+        next_vehicle_uid = max_uid;
+    } else {
+        next_vehicle_uid = std::max( next_vehicle_uid, uid + 1 );
+    }
+}
+
 Creature *game::is_hostile_nearby()
 {
     int distance = ( get_option<int>( "SAFEMODEPROXIMITY" ) <= 0 ) ? MAX_VIEW_DISTANCE :
@@ -4673,6 +4728,11 @@ void game::use_computer( const tripoint_bub_ms &p )
         }
         return;
     }
+    if( used->has_platform_access_handler() &&
+        !cata::lua_platform::invoke_computer_access_handler(
+            *used, get_player_character() ).value_or( false ) ) {
+        return;
+    }
     if( used->eocs.empty() ) {
         computer_session( *used ).use();
     } else {
@@ -4816,7 +4876,7 @@ monster *game::place_critter_around( const mtype_id &id, const tripoint_bub_ms &
     monster *const placed =
         place_critter_around( mon, center, radius );
     if( placed != nullptr ) {
-        cata::lua_ui::dispatch_native_monster_spawn(
+        cata::lua_platform::dispatch_native_monster_spawn(
             *placed, "placement" );
     }
     return placed;
@@ -4862,7 +4922,7 @@ monster *game::place_critter_within( const mtype_id &id,
     mon->ammo = mon->type->starting_ammo;
     monster *const placed = place_critter_within( mon, range );
     if( placed != nullptr ) {
-        cata::lua_ui::dispatch_native_monster_spawn(
+        cata::lua_platform::dispatch_native_monster_spawn(
             *placed, "placement" );
     }
     return placed;
@@ -4900,7 +4960,7 @@ monster *game::place_critter_at_or_within( const shared_ptr_fast<monster> &mon, 
     mon->spawn( here->get_abs( where.value() ) );
     if( critter_tracker->add( mon ) ) {
         mon->gravity_check();
-        cata::lua_ui::dispatch_native_monster_spawn(
+        cata::lua_platform::dispatch_native_monster_spawn(
             *mon, "mapgen" );
         return mon.get();
     }
@@ -4999,7 +5059,7 @@ bool game::spawn_hallucination( const tripoint_bub_ms &p )
         if( !get_creature_tracker().creature_at( p, true ) ) {
             overmap_buffer.insert_npc( tmp );
             load_npcs();
-            cata::lua_ui::dispatch_native_npc_spawn(
+            cata::lua_platform::dispatch_native_npc_spawn(
                 *tmp, "hallucination" );
             return true;
         } else {
@@ -5043,7 +5103,7 @@ bool game::spawn_hallucination( const tripoint_bub_ms &p, const mtype_id &mt,
     //Don't attempt to place phantasms inside of other creatures
     if( !get_creature_tracker().creature_at( phantasm->pos_bub(), true ) ) {
         if( critter_tracker->add( phantasm ) ) {
-            cata::lua_ui::dispatch_native_monster_spawn(
+            cata::lua_platform::dispatch_native_monster_spawn(
                 *phantasm, "hallucination" );
             return true;
         }
@@ -5077,7 +5137,7 @@ bool game::spawn_npc( const tripoint_bub_ms &p, const string_id<npc_template> &n
             tmp->set_summon_time( lifespan.value() );
         }
         load_npcs();
-        cata::lua_ui::dispatch_native_npc_spawn(
+        cata::lua_platform::dispatch_native_npc_spawn(
             *tmp, "summon" );
         return true;
     } else {
@@ -5367,7 +5427,7 @@ void game::save_cyborg( item *cyborg, const tripoint_bub_ms &couch_pos, Characte
         tmp->hurtall( dmg_lvl * 10, nullptr );
         tmp->add_effect( effect_downed, rng( 1_turns, 4_turns ), false, 0, true );
         load_npcs();
-        cata::lua_ui::dispatch_native_npc_spawn(
+        cata::lua_platform::dispatch_native_npc_spawn(
             *tmp, "cyborg" );
 
     } else {
@@ -5616,7 +5676,7 @@ void game::control_vehicle( const std::optional<tripoint_bub_ms> &p )
 
 bool game::npc_menu( npc &who )
 {
-    if( !cata::lua_ui::begin_native_npc_interaction(
+    if( !cata::lua_platform::begin_native_npc_interaction(
             u, who ) ) {
         return false;
     }
@@ -5993,7 +6053,7 @@ void game::examine( const tripoint_bub_ms &examp, bool with_pickup )
         monster *mon = dynamic_cast<monster *>( c );
         if( mon != nullptr ) {
             add_msg( _( "There is a %s." ), mon->get_name() );
-            if( cata::lua_ui::allow_native_monster_interaction(
+            if( cata::lua_platform::allow_native_monster_interaction(
                     u, *mon ) ) {
                 if( mon->has_effect( effect_pet ) && !u.is_mounted() ) {
                     if( monexamine::pet_menu( *mon ) ) {
@@ -7313,9 +7373,11 @@ void game::butcher( const std::optional<tripoint_bub_ms> &p )
 
     // Magic indices for special butcher options
     const int MAX_ITEM = max_item_in_square;
-    const int MULTISALVAGE = MAX_ITEM + 1, MULTIBUTCHER = MAX_ITEM + 2,
-              MULTIDISASSEMBLE_ONE = MAX_ITEM + 3,
-              MULTIDISASSEMBLE_ALL = MAX_ITEM + 4, NUM_BUTCHER_ACTIONS = MAX_ITEM + 5;
+    const int MULTISALVAGE = MAX_ITEM + 1;
+    const int MULTIBUTCHER = MAX_ITEM + 2;
+    const int MULTIDISASSEMBLE_ONE = MAX_ITEM + 3;
+    const int MULTIDISASSEMBLE_ALL = MAX_ITEM + 4;
+    const int NUM_BUTCHER_ACTIONS = MAX_ITEM + 5;
     // What are we butchering (i.e.. which vector to pick indices from)
     enum {
         BUTCHER_CORPSE,
@@ -8190,21 +8252,21 @@ bool game::walk_move( const tripoint_bub_ms &dest_loc, const bool via_ramp,
     u.set_underwater( false );
 
     const bool has_player_try_move =
-        cata::lua_ui::has_native_hook( "on_player_try_move" );
+        cata::lua_platform::has_native_hook( "on_player_try_move" );
     const bool has_character_try_move =
-        cata::lua_ui::has_native_hook( "on_character_try_move" );
+        cata::lua_platform::has_native_hook( "on_character_try_move" );
     if( has_player_try_move || has_character_try_move ) {
         const monster *const mount =
             u.is_mounted() ? u.mounted_creature.get() : nullptr;
-        cata::lua_ui::native_callback_arguments payload = {
+        cata::lua_platform::native_callback_arguments payload = {
             { "player", static_cast<const Character *>( &u ) },
             {
-                "from", cata::lua_ui::native_callback_point {
+                "from", cata::lua_platform::native_callback_point {
                     "bub_ms", tripoint_rel_ms( pos.x(), pos.y(), pos.z() )
                 }
             },
             {
-                "to", cata::lua_ui::native_callback_point {
+                "to", cata::lua_platform::native_callback_point {
                     "bub_ms", tripoint_rel_ms( dest_loc.x(), dest_loc.y(), dest_loc.z() )
                 }
             },
@@ -8216,14 +8278,14 @@ bool game::walk_move( const tripoint_bub_ms &dest_loc, const bool via_ramp,
         bool allowed = true;
         if( has_player_try_move ) {
             const bool player_allowed =
-                cata::lua_ui::dispatch_native_hook(
+                cata::lua_platform::dispatch_native_hook(
                     "on_player_try_move", payload );
             allowed = player_allowed && allowed;
         }
         if( has_character_try_move ) {
             payload.front().name = "character";
             const bool character_allowed =
-                cata::lua_ui::dispatch_native_hook(
+                cata::lua_platform::dispatch_native_hook(
                     "on_character_try_move", payload );
             allowed = character_allowed && allowed;
         }
@@ -8784,7 +8846,12 @@ point_rel_sm game::place_player( const tripoint_bub_ms &dest_loc, bool quick )
     if( u.is_hauling() && ( !here.can_put_items( dest_loc ) ||
                             here.has_flag( ter_furn_flag::TFLAG_DEEP_WATER, dest_loc ) ||
                             vp1 ) ) {
-        u.stop_hauling();
+        // returns false if not automoving in the first place
+        if( cancel_auto_move( *u.as_character(), _( "You're about to stop hauling!" ) ) ) {
+            return point_rel_sm::zero;
+        } else {
+            u.stop_hauling();
+        }
     }
     u.setpos( here, dest_loc );
     if( u.is_mounted() ) {
@@ -11083,7 +11150,7 @@ void game::perhaps_add_random_npc( bool ignore_spawn_timers_and_rates )
                           tmp->getID() ) );
     // This will make the new NPC active- if its nearby to the player
     load_npcs();
-    cata::lua_ui::dispatch_native_npc_spawn( *tmp, "random" );
+    cata::lua_platform::dispatch_native_npc_spawn( *tmp, "random" );
 }
 
 // Redraw window and show spinner, so cata window doesn't look frozen while pathfinding on overmap
@@ -11945,10 +12012,10 @@ pulp_data game::calculate_character_ability_to_pulp( const Character &you )
     // bash is good, but the rest physical damages can be useful also
     damage_instance di;
     u.roll_damage( damage_cut, false, di, true, pair_bash.second, attack_vector_id::NULL_ID(),
-                   sub_bodypart_str_id::NULL_ID(), 1.f );
+                   sub_bodypart_str_id::NULL_ID(), 1.f, 0.f );
 
     u.roll_damage( damage_stab, false, di, true, pair_bash.second, attack_vector_id::NULL_ID(),
-                   sub_bodypart_str_id::NULL_ID(), 1.f );
+                   sub_bodypart_str_id::NULL_ID(), 1.f, 0.f );
 
     for( const damage_unit &du : di ) {
         // potentially move it to json, if someone find necrotic mace +3 should pulp faster for some reason
@@ -12144,12 +12211,16 @@ void avatar_moves( const tripoint_abs_ms &old_abs_pos, const avatar &u, const ma
             effect_on_condition_id eoc = cur_ter->get_exit_EOC();
             eoc->activate_activation_only( d, "OMT movement" );
         }
+        cata::lua_platform::invoke_overmap_terrain_handler(
+            past_ter->get_type_id().str(), "exit", old_abs_omt, new_abs_omt, u );
 
         if( !cur_ter->get_entry_EOC().is_null() ) {
             dialogue d( get_talker_for( get_avatar() ), nullptr );
             effect_on_condition_id eoc = cur_ter->get_entry_EOC();
             eoc->activate_activation_only( d, "OMT movement" );
         }
+        cata::lua_platform::invoke_overmap_terrain_handler(
+            cur_ter->get_type_id().str(), "entry", old_abs_omt, new_abs_omt, u );
 
     }
 }

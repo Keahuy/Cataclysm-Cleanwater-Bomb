@@ -11,6 +11,7 @@
 #include "type_id.h"
 
 class JsonObject;
+class Character;
 class read_only_visitable;
 
 enum class butcher_type : int;
@@ -19,6 +20,7 @@ enum class creature_size : int;
 namespace cata::lua_platform
 {
 class content_transaction;
+class items_content_transaction;
 } // namespace cata::lua_platform
 
 /**
@@ -35,7 +37,8 @@ class butchery_requirements
 
         // tries to find the requirement with the highest speed bonus. if it fails it returns std::nullopt
         std::pair<float, requirement_id> get_fastest_requirements(
-            const read_only_visitable &crafting_inv, creature_size size, butcher_type butcher ) const;
+            const Character *actor, const read_only_visitable &crafting_inv, creature_size size,
+            butcher_type butcher ) const;
 
         static void load_butchery_req( const JsonObject &jo, const std::string &src );
         static void finalize_all();
@@ -46,6 +49,7 @@ class butchery_requirements
         bool is_valid() const;
     private:
         friend class cata::lua_platform::content_transaction;
+        friend class cata::lua_platform::items_content_transaction;
         // int is speed bonus
         std::map<float, std::map<creature_size, std::map<butcher_type, requirement_id>>> requirements;
 };

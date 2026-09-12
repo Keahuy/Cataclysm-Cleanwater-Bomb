@@ -62,6 +62,7 @@
 #include "game_ui.h"
 #include "hash_utils.h"
 #include "horde_entity.h"
+#include "hover_mouse_input.h"
 #include "input.h"
 #include "input_context.h"
 #include "input_replay.h"
@@ -72,6 +73,7 @@
 #include "map_extras.h"
 #include "mapbuffer.h"
 #include "mission.h"
+#include "mouse_button_capture.h"
 #include "npc.h"
 #include "options.h"
 #include "output.h"
@@ -147,6 +149,9 @@ static bool needupdate = false;
 // Synthetic Android touch clicks carry their own coordinates.  Preserve them
 // instead of replacing them with the (usually stale) hardware mouse position.
 static bool last_input_has_explicit_mouse_pos = false;
+#if defined(__ANDROID__)
+    static hover_mouse_input_state android_hover_mouse_input;
+#endif
 static bool need_invalidate_framebuffers = false;
 palette_array windowsPalette;
 
@@ -636,6 +641,9 @@ static Uint32 renderer_watch_window_id = 0;
 //Registers, creates, and shows the Window!!
 static void WinCreate()
 {
+#if defined(__ANDROID__)
+    android_hover_mouse_input.deactivate();
+#endif
     // Common flags used for windowed mode (fullscreen applied after creation)
     Uint32 window_flags = CATA_WINDOW_RESIZABLE | CATA_WINDOW_HIGH_DPI;
     WindowWidth = TERMINAL_WIDTH * fontwidth * scaling_factor;
@@ -876,6 +884,7 @@ static void WinDestroy()
     SDL_DelEventWatch( renderer_event_watch, &renderer_coordinator );
 #endif
 #if defined(__ANDROID__)
+    android_hover_mouse_input.deactivate();
     touch_joystick.reset();
 #endif
     imclient.reset();
@@ -1583,6 +1592,15 @@ void get_display_buffer_dims( int *w, int *h )
     }
 }
 
+bool is_mouse_active_for_edge_scrolling()
+{
+#if defined(__ANDROID__)
+    return android_hover_mouse_input.active();
+#else
+    return true;
+#endif
+}
+
 SDL_Point window_to_display_buffer_coords( SDL_Point window_pt )
 {
     if( !window ) {
@@ -1607,6 +1625,17 @@ SDL_Point window_to_display_buffer_coords( SDL_Point window_pt )
         static_cast<int>( static_cast<int64_t>( window_pt.x - dstrect.x ) * buf_w / dstrect.w ),
         static_cast<int>( static_cast<int64_t>( window_pt.y - dstrect.y ) * buf_h / dstrect.h )
     };
+#elif SDL_MAJOR_VERSION >= 3
+    // Use SDL's renderer transformation for SDL3 window coordinates.
+    if( renderer ) {
+        float rx = 0.0f;
+        float ry = 0.0f;
+        if( SDL_RenderCoordinatesFromWindow( renderer.get(), static_cast<float>( window_pt.x ),
+                                             static_cast<float>( window_pt.y ), &rx, &ry ) ) {
+            return SDL_Point{ static_cast<int>( rx ), static_cast<int>( ry ) };
+        }
+    }
+    return window_pt;
 #else
     int win_w = 0;
     int win_h = 0;
@@ -1963,6 +1992,7 @@ static void reset_context_minimaps()
 {
     for_each_unique_tile_context( []( cata_tiles & c ) {
         c.reset_minimap();
+        c.reset_character_preview();
     } );
 }
 
@@ -2755,6 +2785,29 @@ bool renderer_recovery_test_support::setup_software_renderer()
     return true;
 }
 
+bool renderer_recovery_test_support::install_character_preview_targets()
+{
+    if( tilecontext ) {
+        return false;
+    }
+    tilecontext = std::make_unique<cata_tiles>( renderer, geometry, ts_cache );
+    tilecontext->char_preview_work_tex = CreateTexture( renderer, SDL_PIXELFORMAT_ARGB8888,
+                                         SDL_TEXTUREACCESS_TARGET, 8, 8 );
+    tilecontext->char_preview_tex = CreateTexture( renderer, SDL_PIXELFORMAT_ARGB8888,
+                                    SDL_TEXTUREACCESS_TARGET, 4, 4 );
+    return tilecontext->char_preview_work_tex && tilecontext->char_preview_tex;
+}
+
+bool renderer_recovery_test_support::has_character_preview_targets()
+{
+    return tilecontext && ( tilecontext->char_preview_work_tex || tilecontext->char_preview_tex );
+}
+
+void renderer_recovery_test_support::remove_character_preview_context()
+{
+    tilecontext.reset();
+}
+
 void renderer_recovery_test_support::teardown_software_renderer()
 {
     ts_cache.release_live_atlases();
@@ -2821,6 +2874,24 @@ std::shared_ptr<const tileset> renderer_recovery_test_support::install_synthetic
     };
     ts_cache.tilesets_.insert_or_assign( key, ts );
     return ts;
+}
+
+point renderer_recovery_test_support::character_preview_size( const Character &ch, int scale )
+{
+    auto ts = std::const_pointer_cast<tileset>( install_synthetic_bundle(
+                  "character_preview_test", "color_pixel_sepia_light",
+                  renderer_coordinator.instance_generation(), renderer_coordinator.textures_generation() ) );
+    ts->tile_width = 1;
+    ts->tile_height = 1;
+    tile_type player_tile;
+    player_tile.fg.add( std::vector<int> { 0 }, 1 );
+    ts->create_tile_type( "player_male", tile_type( player_tile ) );
+    ts->create_tile_type( "player_female", tile_type( player_tile ) );
+    cata_tiles preview( renderer, geometry, ts_cache );
+    preview.tileset_ptr = ts;
+    point size;
+    preview.render_character_preview( ch, scale, size.x, size.y );
+    return size;
 }
 
 atlas_replay_quarantine::gate renderer_recovery_test_support::populate_mode2_quarantine(
@@ -5468,11 +5539,14 @@ static void android_request_repaint()
 
 static void android_force_full_redraw()
 {
-    if( g != nullptr && android_has_active_world() ) {
-        g->invalidate_main_ui_adaptor();
-    } else {
-        ui_manager::invalidate_all_ui_adaptors();
-    }
+    // This path services lifecycle, visible-frame and input-context changes.
+    // The display buffer may have been cleared or replaced, so invalidating
+    // only the gameplay adaptor is insufficient while a menu is on top: a
+    // fully covering menu can suppress the lower invalidation and remain
+    // "clean", leaving the cleared frame visible until the next keypress.
+    // Rebuild the complete active stack so the current menu is present in the
+    // first frame after the transition as well.
+    ui_manager::invalidate_all_ui_adaptors();
     ui_manager::redraw_invalidated();
     needupdate = true;
 }
@@ -6069,6 +6143,7 @@ static bool pop_extra_button_input( input_event &event )
 //Check for any window messages (keypress, paint, mousemove, etc)
 static void CheckMessages()
 {
+    static mouse_button_capture imgui_mouse_buttons;
     SDL_Event ev;
     bool quit = false;
     bool text_refresh = false;
@@ -6143,6 +6218,8 @@ static void CheckMessages()
                            android_has_active_world();
     quick_shortcuts_t &qsl = quick_shortcuts_map[get_quick_shortcut_name(
                                  touch_input_context.get_category() )];
+
+    const bool allow_touch_repeat = !needupdate;
 
     // Don't do this logic if we already need an update, otherwise we're likely to overload the game with too much input on hold repeat events
     if( !needupdate ) {
@@ -6351,42 +6428,6 @@ static void CheckMessages()
             }
         }
 
-        // Handle repeating inputs from touch + holds
-        if( !android_imgui_touch_state.captures_touch && !is_quick_shortcut_touch &&
-            !is_two_finger_touch && !is_three_finger_touch &&
-            finger_down_time > 0 &&
-            ticks - finger_down_time > static_cast<uint32_t>
-            ( get_option<int>( "ANDROID_INITIAL_DELAY" ) ) ) {
-            const float held_distance = std::hypot( finger_curr_x - finger_down_x,
-                                                    finger_curr_y - finger_down_y );
-            const float hold_deadzone = get_option<float>( "ANDROID_DEADZONE_RANGE" ) *
-                                        std::max( WindowWidth, WindowHeight );
-            const bool precision_hold = android_ui_mode::is_new_ui_build() && is_default_mode &&
-                                        get_option<bool>( "ANDROID_LONG_PRESS_CONTEXT" ) &&
-                                        held_distance < hold_deadzone;
-            if( !precision_hold && ticks - finger_repeat_time > finger_repeat_delay ) {
-                handle_finger_input( ticks );
-                finger_repeat_time = ticks;
-                // Prevent repeating inputs on the next call to this function if there is a fingerup event
-                while( SDL_PollEvent( &ev ) ) {
-                    if( ev.type == CATA_FINGERUP ) {
-                        third_finger_down_x = third_finger_curr_x = second_finger_down_x = second_finger_curr_x =
-                                                  finger_down_x = finger_curr_x = -1.0f;
-                        third_finger_down_y = third_finger_curr_y = second_finger_down_y = second_finger_curr_y =
-                                                  finger_down_y = finger_curr_y = -1.0f;
-                        is_two_finger_touch = false;
-                        is_three_finger_touch = false;
-                        finger_down_time = 0;
-                        finger_repeat_time = 0;
-                        finger_slot_clear( GetFingerID( ev ) );
-                        // let the next call decide if needupdate should be true
-                        break;
-                    }
-                }
-                return;
-            }
-        }
-
         // If we received a first tap and not another one within a certain period, this was a single tap, so trigger the input event
         if( !is_quick_shortcut_touch && !is_two_finger_touch && !is_three_finger_touch &&
             last_tap_time > 0 &&
@@ -6444,18 +6485,63 @@ static void CheckMessages()
     int imgui_buf_h = 0;
     get_display_buffer_dims( &imgui_buf_w, &imgui_buf_h );
     while( SDL_PollEvent( &ev ) ) {
+#if defined(__ANDROID__)
+        // Touchscreens do not provide a persistent hover position.  SDL's
+        // hardware mouse state remains at its default (usually 0, 0) on a
+        // touch-only device, so only real mouse input may enable timeout-based
+        // edge scrolling.  Switching back to touch also retires a stale
+        // external-mouse position until that mouse is used again.
+        if( IsWindowEvent( ev ) &&
+            GetWindowEventID( ev ) == CATA_WINDOWEVENT_FOCUS_LOST ) {
+            android_hover_mouse_input.deactivate();
+        } else if( ev.type == CATA_FINGERMOTION || ev.type == CATA_FINGERDOWN ||
+                   ev.type == CATA_FINGERUP ) {
+            android_hover_mouse_input.deactivate();
+        } else if( ev.type == CATA_MOUSEMOTION ) {
+            if( ev.motion.which == SDL_TOUCH_MOUSEID ) {
+                android_hover_mouse_input.deactivate();
+            } else {
+                android_hover_mouse_input.activate();
+            }
+        } else if( ev.type == CATA_MOUSEBUTTONDOWN || ev.type == CATA_MOUSEBUTTONUP ) {
+            if( ev.button.which == SDL_TOUCH_MOUSEID ) {
+                android_hover_mouse_input.deactivate();
+            } else {
+                android_hover_mouse_input.activate();
+            }
+        } else if( ev.type == CATA_MOUSEWHEEL ) {
+            if( ev.wheel.which == SDL_TOUCH_MOUSEID ) {
+                android_hover_mouse_input.deactivate();
+            } else {
+                android_hover_mouse_input.activate();
+            }
+        }
+#if SDL_MAJOR_VERSION >= 3
+        else if( ev.type == SDL_EVENT_MOUSE_REMOVED ) {
+            android_hover_mouse_input.deactivate();
+        }
+#endif
+#endif
         // Build a display_buffer-coord copy for ImGui and gameplay
         // consumers. The raw `ev` stays in window coordinates so android
         // shortcut and joystick hit-tests see the same domain SDL emitted.
         SDL_Event ev_display = ev;
         convert_event_to_display_buffer_coords( &ev_display );
-        imclient->process_input( &ev_display, imgui_buf_w, imgui_buf_h );
+        imclient->process_input( &ev_display, imgui_buf_w, imgui_buf_h, scaling_factor );
+
+        if( IsWindowEvent( ev ) && GetWindowEventID( ev ) == CATA_WINDOWEVENT_FOCUS_LOST ) {
+            imgui_mouse_buttons.clear();
+        }
+        const bool imgui_owns_mouse_button =
+            ( ev.type == CATA_MOUSEBUTTONDOWN || ev.type == CATA_MOUSEBUTTONUP ) &&
+            imgui_mouse_buttons.process( ev.button.button, ev.type == CATA_MOUSEBUTTONDOWN,
+                                         cataimgui::client::want_capture_mouse() );
 
         bool imgui_owns_text_event = cataimgui::client::want_text_input() &&
                                      ( ev.type == CATA_KEYDOWN || ev.type == CATA_KEYUP ||
                                        ev.type == CATA_TEXTINPUT || ev.type == CATA_TEXTEDITING );
 #if defined(__ANDROID__)
-        // Android's system Back key dismisses the focused text widget below;
+        // Android's system Back key toggles the soft keyboard below;
         // it is not text editing input and must keep following that path.
         if( imgui_owns_text_event &&
             ( ev.type == CATA_KEYDOWN || ev.type == CATA_KEYUP ) &&
@@ -6647,12 +6733,7 @@ static void CheckMessages()
                         if( ( !android_ui_mode::is_new_ui_build() || ac_back_down_time > 0 ) &&
                             ticks - ac_back_down_time <= static_cast<uint32_t>
                             ( get_option<int>( "ANDROID_INITIAL_DELAY" ) ) ) {
-                            if( cataimgui::client::want_text_input() ) {
-                                // ImGui owns the keyboard while a text widget is
-                                // focused. Defocus it so ImGui releases text input
-                                // and the keyboard dismisses.
-                                cataimgui::client::clear_text_focus();
-                            } else if( IsTextInputActive( ::window.get() ) ) {
+                            if( IsTextInputActive( ::window.get() ) ) {
                                 focus_aware_stop_text_input();
                             } else {
                                 focus_aware_start_text_input();
@@ -6781,7 +6862,7 @@ static void CheckMessages()
                     if( ! mouse.enabled ) {
                         break;
                     }
-                    if( cataimgui::client::want_capture_mouse() ) {
+                    if( imgui_owns_mouse_button ) {
                         break;
                     }
                     switch( ev.button.button ) {
@@ -6804,7 +6885,7 @@ static void CheckMessages()
                     if( ! mouse.enabled ) {
                         break;
                     }
-                    if( cataimgui::client::want_capture_mouse() ) {
+                    if( imgui_owns_mouse_button ) {
                         break;
                     }
                     switch( ev.button.button ) {
@@ -6859,10 +6940,10 @@ static void CheckMessages()
                             if( !is_quick_shortcut_touch ) {
                                 update_finger_repeat_delay();
                             }
-                            // Legacy joystick and shortcut overlays still redraw while
-                            // moving. New UI ImGui touches are coalesced below instead.
+                            // Repaint the joystick/shortcuts at the end of the event
+                            // batch. Redrawing the whole ImGui menu for each motion
+                            // makes touch input accumulate behind recipe previews.
                             needupdate = true;
-                            ui_manager::redraw_invalidated();
                         }
 
                         if( !android_imgui_touch_state.captures_touch &&
@@ -6930,8 +7011,8 @@ static void CheckMessages()
                             // Do not hover or press a widget until this gesture is
                             // known to be a tap or a control drag.
                         } else {
-                            ui_manager::redraw_invalidated();
-                            // Ensure virtual joystick and quick shortcuts redraw.
+                            // The overlays are drawn by refresh_display(). Menu
+                            // contents redraw once in their own input loop.
                             needupdate = true;
                         }
                     } else if( slot == 1 ) {
@@ -7261,6 +7342,28 @@ static void CheckMessages()
     }
 #if defined(__ANDROID__)
     android_service_imgui_touch( GetTicks() );
+    // Dispatch queued motion and release events before using the held direction.
+    // Never drain SDL events here: the normal dispatcher must see every event.
+    // Handle repeating inputs from touch + holds
+    if( allow_touch_repeat && !quit && last_input.type == input_event_t::error &&
+        !android_imgui_touch_state.captures_touch && !is_quick_shortcut_touch &&
+        !is_two_finger_touch && !is_three_finger_touch &&
+        finger_down_time > 0 &&
+        ticks - finger_down_time > static_cast<uint32_t>
+        ( get_option<int>( "ANDROID_INITIAL_DELAY" ) ) ) {
+        const float held_distance = std::hypot( finger_curr_x - finger_down_x,
+                                                finger_curr_y - finger_down_y );
+        const float hold_deadzone = get_option<float>( "ANDROID_DEADZONE_RANGE" ) *
+                                    std::max( WindowWidth, WindowHeight );
+        const bool precision_hold = android_ui_mode::is_new_ui_build() && is_default_mode &&
+                                    get_option<bool>( "ANDROID_LONG_PRESS_CONTEXT" ) &&
+                                    held_distance < hold_deadzone;
+        if( !precision_hold && ticks - finger_repeat_time > finger_repeat_delay ) {
+            handle_finger_input( ticks );
+            finger_repeat_time = ticks;
+        }
+    }
+
 #endif
     if( needupdate ) {
         try_sdl_update();
@@ -7272,6 +7375,11 @@ static void CheckMessages()
         // report_unvisited() -> DebugLog() after the debug subsystem is gone,
         // crashing. Disable the report globally before exiting.
         Json::globally_report_unvisited_members( false );
+        input_replay::finish();
+        // Match normal exit: destroy the game while its Lua session registries
+        // and renderer dependencies are still alive. Leaving g to static
+        // destruction makes game::~game() revisit already-destroyed registries.
+        g.reset();
         catacurses::endwin();
         exit( 0 );
     }

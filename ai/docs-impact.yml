@@ -46,48 +46,23 @@ entries:
   - id: lua-public-contract
     enforcement: required
     patterns:
-      - src/catalua*
+      - src/lua_platform*
       - src/event.h
-      - data/lua/manifest.schema.json
-      - data/lua/types/ccb_api_v5.d.lua
-      - data/lua/reference/*
+      - data/lua/types/ccb_platform_v1.d.lua
+      - data/lua/reference/ccb_platform_*
       - tools/lua_api/*
     documentation_ids:
-      - api.lua.v5.overview
-      - api.lua.v5.lifecycle
-      - api.lua.v5.events
-      - api.lua.v5.capabilities
-      - api.lua.v5.permissions
-      - api.lua.v5.ui
-      - api.lua.v5.debugging
-      - api.lua.v5.performance
-      - api.lua.v5.migration
-      - api.lua.v5.changelog
-      - api.lua.v5.example-mod
-      - api.lua.v5.reference.modules
-      - api.lua.v5.reference.namespaces
-      - api.lua.v5.reference.classes
-      - api.lua.v5.reference.functions
-      - api.lua.v5.reference.methods
-      - api.lua.v5.reference.properties
-      - api.lua.v5.reference.operators
-      - api.lua.v5.reference.enums
-      - api.lua.v5.reference.events
-      - api.lua.v5.reference.hooks
-      - api.lua.v5.reference.callbacks
-      - api.lua.v5.reference.capabilities
-      - api.lua.v5.reference.permissions
-      - api.lua.v5.reference.manifest-fields
+      - cpp.lua-bridge
     generated_reference_impact: true
     required_check_ids: [documentation-impact, lua-contract]
     documentation_readiness:
       state: bilingual_draft
       languages: [zh_CN, en]
       repository: CrimsonCrossBunker/CCB-Docs
-      ref: agent/ccb-docs-program-lua-reference
-      commit: 7fc27b606fed83b5dbcef57506b28a84cce046c1
-      source_commit: 3ac0bd7f356b30b880dc655f3006ebf1cbda9cfd
-      activation_gate: Refresh to the merged CCB source commit and promote every mapped page from draft before this enforcement PR merges.
+      ref: codex/pr695-lua-build-contract-docs
+      commit: e64c8fd458f9f9fc140904b9c829f4009e5ce6fb
+      source_commit: b9a8d08beffe5b77aca4d4ff7f80821a7e6bb94c
+      activation_gate: Keep CCB-Docs PR #38 draft until source PR #695 merges; then refresh it to the final source merge commit and promote the mapped page before the documentation PR merges.
     risk_group: lua-api
     risk_level: high
 
@@ -95,6 +70,7 @@ entries:
     enforcement: advisory
     patterns:
       - data/lua/LUA_FIRST_PLATFORM.md
+      - data/lua/LUA_FIRST_EOC_WORKFLOW.md
       - ai/lua-first-roadmap.yml
       - ai/lua-first-roadmap.schema.json
       - ai/lua-first-replacement-ledger.yml
@@ -104,8 +80,26 @@ entries:
       - data/mods/Lua_First_Example/**
       - tools/create_lua_mod.py
       - tools/migrate_lua_first.py
-      - src/catalua_platform*.cpp
-      - src/catalua_platform*.h
+      - src/lua_platform_loader.cpp
+      - src/lua_platform_loader.h
+      - src/lua_platform_runtime.cpp
+      - src/lua_platform_runtime.h
+      - src/lua_platform_runtime_services.cpp
+      - src/lua_platform_content_presentation.cpp
+      - src/lua_platform_content_presentation.h
+      - src/lua_platform_content_worldgen.cpp
+      - src/lua_platform_content_worldgen.h
+      - src/lua_platform_content_items.cpp
+      - src/lua_platform_content_items.h
+      - src/lua_platform_content_creatures.cpp
+      - src/lua_platform_content_creatures.h
+      - src/lua_platform_content_character.cpp
+      - src/lua_platform_content_character.h
+      - src/lua_platform_content.h
+      - src/lua_platform_world_content.cpp
+      - src/lua_platform_world_content.h
+      - src/lua_platform_hooks.cpp
+      - src/lua_platform_hooks.h
       - src/mod_manager.cpp
       - src/mod_manager.h
       - src/mod_manager_ui.cpp
@@ -113,9 +107,9 @@ entries:
       - src/game.cpp
       - src/do_turn.cpp
     documentation_ids:
-      - architecture.lua-first-platform
-      - architecture.lua-first-roadmap
+      - cpp.lua-bridge
       - architecture.lua-first-glossary
+      - architecture.lua-first-eoc-workflow
     generated_reference_impact: false
     required_check_ids: [agent-context]
     risk_group: lua-platform

@@ -1,7 +1,14 @@
 #include "mattack_common.h" // IWYU pragma: associated
+#include "mod_id_compat.h"
 #include "monstergenerator.h" // IWYU pragma: associated
 
+#include <clone_ptr.h>
+#include <dialogue_helpers.h>
+#include <enum_bitset.h>
+#include <pimpl.h>
+#include <translation.h>
 #include <algorithm>
+#include <cstddef>
 #include <optional>
 #include <set>
 #include <string>
@@ -10,7 +17,6 @@
 
 #include "cached_options.h"
 #include "calendar.h"
-#include "catalua_platform_content.h"
 #include "cata_utility.h"
 #include "color.h"
 #include "condition.h"
@@ -24,6 +30,7 @@
 #include "generic_factory.h"
 #include "item.h"
 #include "item_group.h"
+#include "lua_platform_content.h"
 #include "magic.h"
 #include "mattack_actors.h"
 #include "monattack.h"
@@ -1061,6 +1068,14 @@ void mtype::load( const JsonObject &jo, const std::string_view src )
     optional( jo, was_loaded, "dodge", sk_dodge, numeric_bound_reader<int> {0} );
 
     // FIXME: load resistances by reader class
+    if( jo.has_member( "block" ) ) {
+        JsonObject block_jo = jo.get_object( "block" );
+
+        block.chance = block_jo.get_int( "chance", 0 );
+        block.effectiveness = block_jo.get_int( "effectiveness", 0 );
+        block.count = block_jo.get_int( "count", 0 );
+        block.ranged = block_jo.get_bool( "ranged", false );
+    }
     if( jo.has_object( "armor" ) ) {
         armor = load_resistances_instance( jo.get_object( "armor" ) );
     }
@@ -1520,7 +1535,7 @@ void MonsterGenerator::load_monster_attack( const JsonObject &jo, const std::str
 void MonsterGenerator::check_monster_definitions() const
 {
     for( const mtype &mon : mon_templates->get_all() ) {
-        if( !mon.src.empty() && mon.src.back().second.str() == "dda" ) {
+        if( !mon.src.empty() && is_core_data_source( mon.src.back().second.str() ) ) {
             std::string mon_id = mon.id.str();
             std::string suffix_id = mon_id.substr( 0, mon_id.find( '_' ) );
             if( suffix_id != "mon" && suffix_id != "pseudo" ) {

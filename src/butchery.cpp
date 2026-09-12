@@ -1,5 +1,7 @@
 #include "butchery.h"
 
+#include <item_location.h>
+#include <type_id.h>
 #include <algorithm>
 #include <array>
 #include <climits>
@@ -68,8 +70,8 @@ static const harvest_drop_type_id harvest_drop_skin( "skin" );
 
 static const itype_id itype_burnt_out_bionic( "burnt_out_bionic" );
 
-static const json_character_flag json_flag_INSTANT_BLEED( "INSTANT_BLEED" );
 static const json_character_flag json_flag_INSENSITIVITY( "INSENSITIVITY" );
+static const json_character_flag json_flag_INSTANT_BLEED( "INSTANT_BLEED" );
 
 static const morale_type morale_butcher( "morale_butcher" );
 
@@ -86,6 +88,7 @@ static const skill_id skill_firstaid( "firstaid" );
 static const skill_id skill_survival( "survival" );
 
 static const species_id species_HUMAN( "HUMAN" );
+static const species_id species_ZOMBIE( "ZOMBIE" );
 
 namespace io
 {
@@ -182,6 +185,12 @@ butcher_type get_butcher_type( player_activity *act )
     return action;
 }
 
+bool character_has_butchery_empathy( const Character &character, const mtype_id &corpse )
+{
+    return ( corpse == mtype_id::NULL_ID() || !corpse->in_species( species_ZOMBIE ) ) &&
+           character.empathizes_with_monster( corpse );
+}
+
 static bool check_anger_empathetic_npcs_with_cannibalism( const Character &you,
         const mtype_id &monster )
 {
@@ -191,11 +200,12 @@ static bool check_anger_empathetic_npcs_with_cannibalism( const Character &you,
         return true; // NPCs dont accidentally cause player hate
     }
 
-    bool you_empathize = you.empathizes_with_monster( monster );
+    bool you_empathize = character_has_butchery_empathy( you, monster );
     bool nearby_empathetic_npc = false;
 
     for( npc &guy : g->all_npcs() ) {
-        if( guy.is_active() && guy.sees( here, you ) && guy.empathizes_with_monster( monster ) ) {
+        if( guy.is_active() && guy.sees( here, you ) &&
+            character_has_butchery_empathy( guy, monster ) ) {
             nearby_empathetic_npc = true;
             break;
         }
@@ -220,7 +230,8 @@ static bool check_anger_empathetic_npcs_with_cannibalism( const Character &you,
     // !you_empathize && !nearby_empathetic_npc means no check.  Will likely happen for most combinations.
 
     for( npc &guy : g->all_npcs() ) {
-        if( guy.is_active() && guy.sees( here, you ) && guy.empathizes_with_monster( monster ) ) {
+        if( guy.is_active() && guy.sees( here, you ) &&
+            character_has_butchery_empathy( guy, monster ) ) {
             guy.say( _( "<swear!>?  Are you butchering them?  That's not okay, <name_b>." ) );
             // massive opinion penalty
             guy.op_of_u.trust -= 5;
@@ -282,16 +293,16 @@ bool set_up_butchery( player_activity &act, Character &you, butchery_data bd )
     const requirement_id butchery_requirement = bd.req;
 
     if( !butchery_requirement->can_make_with_inventory(
-            you.crafting_inventory( you.pos_bub(), pickup_range ), is_crafting_component ) ) {
+            &you, you.crafting_inventory( you.pos_bub(), pickup_range ), is_crafting_component ) ) {
         std::string popup_output = _( "You can't butcher this; you are missing some tools.\n" );
 
         for( const std::string &str : butchery_requirement->get_folded_components_list(
-                 45, c_light_gray, you.crafting_inventory( you.pos_bub(), pickup_range ),
+                 &you, 45, c_light_gray, you.crafting_inventory( you.pos_bub(), pickup_range ),
                  is_crafting_component ) ) {
             popup_output += str + '\n';
         }
-        for( const std::string &str : butchery_requirement->get_folded_tools_list( 45, c_light_gray,
-                you.crafting_inventory( you.pos_bub(), pickup_range ) ) ) {
+        for( const std::string &str : butchery_requirement->get_folded_tools_list(
+                 &you, 45, c_light_gray, you.crafting_inventory( you.pos_bub(), pickup_range ) ) ) {
             popup_output += str + '\n';
         }
 
@@ -346,14 +357,14 @@ bool set_up_butchery( player_activity &act, Character &you, butchery_data bd )
     // Dissections are slightly less angering than other butcher types
     if( action == butcher_type::DISSECT ) {
         if( you.has_proficiency( proficiency_prof_dissect_humans ) ) {
-            if( you.empathizes_with_monster( corpse.id ) ) {
+            if( character_has_butchery_empathy( you, corpse.id ) ) {
                 // this is a dissection, and we are trained for dissection, so no morale penalty, anger, and lighter flavor text.
                 you.add_msg_if_player( m_good, SNIPPET.random_from_category(
                                            "msg_human_dissection_with_prof" ).value_or( translation() ).translated() );
             }
         } else {
             if( check_anger_empathetic_npcs_with_cannibalism( you, corpse.id ) ) {
-                if( you.empathizes_with_monster( corpse.id ) ) {
+                if( character_has_butchery_empathy( you, corpse.id ) ) {
                     // give us a message indicating we are dissecting without the stomach for it, but not actually butchering. lower morale penalty.
                     you.add_msg_if_player( m_good, SNIPPET.random_from_category(
                                                "msg_human_dissection_no_prof" ).value_or( translation() ).translated() );
@@ -371,7 +382,7 @@ bool set_up_butchery( player_activity &act, Character &you, butchery_data bd )
         }
     } else if( action != butcher_type::DISMEMBER ) {
         if( check_anger_empathetic_npcs_with_cannibalism( you, corpse.id ) ) {
-            if( you.empathizes_with_monster( corpse.id ) ) {
+            if( character_has_butchery_empathy( you, corpse.id ) ) {
                 // give the player a random message showing their disgust and cause morale penalty.
                 you.add_msg_if_player( m_good, SNIPPET.random_from_category(
                                            "msg_human_butchery" ).value_or( translation() ).translated() );
@@ -629,7 +640,7 @@ static std::vector<item> create_charge_items( const itype *drop, int count,
             obj.set_flag( flg );
         }
         for( const fault_id &flt : entry.faults ) {
-            obj.set_fault( flt );
+            obj.set_fault( flt, false, nullptr, true );
         }
         if( !you.backlog.empty() && you.backlog.front().id() == ACT_MULTIPLE_BUTCHER ) {
             obj.set_var( "activity_var", you.name );
@@ -1208,7 +1219,7 @@ std::optional<butcher_type> butcher_submenu( const std::vector<map_stack::iterat
         if( index != -1 ) {
             const mtype &corpse = *corpses[index]->get_mtype();
             const float factor = corpse.harvest->get_butchery_requirements().get_fastest_requirements(
-                                     player_character.crafting_inventory(),
+                                     &player_character, player_character.crafting_inventory(),
                                      corpse.size, bt ).first;
             time_to_cut = butcher_time_to_cut( player_character, *corpses[index], bt ) * factor;
             has_started[bt_i] = butcher_get_progress( *corpses[index], bt ) > 0;
@@ -1217,7 +1228,7 @@ std::optional<butcher_type> butcher_submenu( const std::vector<map_stack::iterat
             for( const map_stack::iterator &it : corpses ) {
                 const mtype &corpse = *it->get_mtype();
                 const float factor = corpse.harvest->get_butchery_requirements().get_fastest_requirements(
-                                         player_character.crafting_inventory(),
+                                         &player_character, player_character.crafting_inventory(),
                                          corpse.size, bt ).first;
                 time_to_cut += butcher_time_to_cut( player_character, *it, bt ) * factor;
                 has_started[bt_i] |= butcher_get_progress( *it, bt ) > 0;

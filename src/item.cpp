@@ -1,5 +1,17 @@
 #include "item.h"
 
+#include <cata_lazy.h>
+#include <crafting_enums.h>
+#include <global_vars.h>
+#include <item_components.h>
+#include <item_contents.h>
+#include <item_location.h>
+#include <item_pocket.h>
+#include <item_uid.h>
+#include <math_parser_diag_value.h>
+#include <safe_reference.h>
+#include <type_id.h>
+#include <visitable.h>
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -21,7 +33,6 @@
 #include "calendar.h"
 #include "cata_assert.h"
 #include "cata_utility.h"
-#include "catalua_ui.h"
 #include "character.h"
 #include "character_id.h"
 #include "character_martial_arts.h"
@@ -97,16 +108,14 @@
 namespace
 {
 constexpr std::string_view internal_plutonium_fuel_var = "internal_plutonium_fuel";
-}
+} // namespace
 
 static const ammotype ammo_battery( "battery" );
-static const ammotype ammo_plutonium( "plutonium" );
 static const ammotype ammo_money( "money" );
+static const ammotype ammo_plutonium( "plutonium" );
 
-static const efftype_id effect_cig( "cig" );
 static const efftype_id effect_shakes( "shakes" );
 static const efftype_id effect_sleep( "sleep" );
-static const efftype_id effect_weed_high( "weed_high" );
 
 static const fault_id fault_emp_reboot( "fault_emp_reboot" );
 
@@ -122,6 +131,7 @@ static const item_category_id item_category_software( "software" );
 static const itype_id itype_barrel_small( "barrel_small" );
 static const itype_id itype_blood( "blood" );
 static const itype_id itype_cash_card( "cash_card" );
+static const itype_id itype_cigar_lit( "cigar_lit" );
 static const itype_id itype_corpse( "corpse" );
 static const itype_id itype_corpse_generic_human( "corpse_generic_human" );
 static const itype_id itype_craft( "craft" );
@@ -145,9 +155,9 @@ static const skill_id skill_weapon( "weapon" );
 static const species_id species_ROBOT( "ROBOT" );
 
 static const trait_id trait_JITTERY( "JITTERY" );
-static const trait_id trait_LIGHTWEIGHT( "LIGHTWEIGHT" );
-static const trait_id trait_TOLERANCE( "TOLERANCE" );
 static const trait_id trait_WOOLALLERGY( "WOOLALLERGY" );
+static const vitamin_id vitamin_cannabis( "cannabis" );
+static const vitamin_id vitamin_nicotine( "nicotine" );
 
 // vitamin flags
 static const std::string flag_NO_SELL( "NO_SELL" );
@@ -330,7 +340,8 @@ item::item( const recipe *rec, int qty, item_components items, std::vector<item_
     components = std::move( items );
     craft_data_->comps_used = std::move( selections );
 
-    if( has_temperature() ) {
+    const bool fresh_rot = rec && rec->get_rot_inherit() == rot_inherit_mode::FRESH;
+    if( has_temperature() && !fresh_rot ) {
         active = true;
         last_temp_check = bday;
         if( goes_bad() ) {
@@ -1228,6 +1239,30 @@ const std::string &item::symbol() const
     return type->sym;
 }
 
+nc_color item::get_fault_color( const nc_color base_color ) const
+{
+    fault_severity severity = fault_severity::none;
+    for( const fault_id &fault : faults ) {
+        severity = std::max( severity, fault->severity() );
+        if( severity == fault_severity::critical ) {
+            break;
+        }
+    }
+
+    switch( severity ) {
+        case fault_severity::none:
+            return base_color;
+        case fault_severity::minor:
+            return c_light_red;
+        case fault_severity::major:
+            return red_background( c_black );
+        case fault_severity::critical:
+            return yellow_background( c_yellow );
+        default:
+            return base_color;
+    }
+}
+
 nc_color item::color_in_inventory( const Character *const ch ) const
 {
     const Character &player_character = ch ? *ch : get_player_character();
@@ -1490,11 +1525,6 @@ void item::on_pickup( Character &p )
 
     p.flag_encumbrance();
     p.on_item_acquire( *this );
-    cata::lua_ui::dispatch_native_callback(
-    "istate", typeId().str(), "on_pickup", {
-        { "character", static_cast<const Character *>( &p ) },
-        { "item", static_cast<const item *>( this ) }
-    } );
 }
 
 void item::update_inherited_flags()
@@ -1566,20 +1596,35 @@ void item::update_prefix_suffix_flags( const flag_id &f )
     }
 }
 
-std::string item::tname( unsigned int quantity, bool with_prefix ) const
+std::string item::tname( unsigned int quantity, bool with_prefix, bool color_faults ) const
 {
-    return tname( quantity, with_prefix ? tname::default_tname : tname::unprefixed_tname );
+    return tname( quantity, with_prefix ? tname::default_tname : tname::unprefixed_tname,
+                  color_faults );
 }
 
-std::string item::tname( unsigned int quantity, tname::segment_bitset const &segments ) const
+std::string item::tname( unsigned int quantity, const tname::segment_bitset &segments,
+                         bool color_faults ) const
 {
     std::string ret;
+    size_t fault_color_start = 0;
 
     for( tname::segments idx : tname::get_tname_set() ) {
         if( !segments[idx] ) {
             continue;
         }
         ret += tname::print_segment( idx, *this, quantity, segments );
+
+        if( idx == tname::segments::DURABILITY ) {
+            fault_color_start = ret.size();
+        }
+    }
+
+    if( color_faults ) {
+        const nc_color fault_color = get_fault_color( c_white );
+        if( fault_color != c_white ) {
+            ret = ret.substr( 0, fault_color_start ) +
+                  colorize( ret.substr( fault_color_start ), fault_color );
+        }
     }
 
     if( item_vars.find( "item_note" ) != item_vars.end() ) {
@@ -1611,9 +1656,9 @@ std::string item::display_money( unsigned int quantity, unsigned int total,
     }
 }
 
-std::string item::display_name( unsigned int quantity ) const
+std::string item::display_name( unsigned int quantity, bool color_faults ) const
 {
-    std::string name = tname( quantity );
+    std::string name = tname( quantity, tname::default_tname, color_faults );
     std::string sidetxt;
     std::string amt;
     std::string cable;
@@ -4258,7 +4303,8 @@ void item::calc_temp( const units::temperature &temp, const float insulation,
     if( std::abs( temperature_difference ) < 0.4 ) {
         return;
     }
-    const float mass = to_gram( weight() ) / ( is_stackable() ? charges : 1 ); // g
+    const float mass = static_cast<float>( to_gram( weight() ) ) /
+                       ( is_stackable() ? charges : 1 ); // g
 
     // If item has negative energy set to environment temperature (it not been processed ever)
     if( units::to_joule_per_gram( specific_energy ) < 0 ) {
@@ -4602,7 +4648,7 @@ bool item::process_litcig( map &here, Character *carrier, const tripoint_bub_ms 
             type->invoke( carrier, *this, pos, "transform" );
         }
         if( typeId() == itype_joint_lit && carrier != nullptr ) {
-            carrier->add_effect( effect_weed_high, 1_minutes ); // one last puff
+            carrier->vitamin_mod( vitamin_cannabis, 2 ); // one last puff
             here.add_field( pos + point( rng( -1, 1 ), rng( -1, 1 ) ), field_type_id( "fd_weedsmoke" ), 2 );
             weed_msg( *carrier );
         }
@@ -4636,17 +4682,29 @@ bool item::process_litcig( map &here, Character *carrier, const tripoint_bub_ms 
     }
     // if carried by someone:
     if( carrier != nullptr ) {
-        time_duration duration = 15_seconds;
-        if( carrier->has_trait( trait_TOLERANCE ) ) {
-            duration = 7_seconds;
-        } else if( carrier->has_trait( trait_LIGHTWEIGHT ) ) {
-            duration = 30_seconds;
-        }
-        carrier->add_msg_if_player( m_neutral, _( "You take a puff of your %s." ), type_name() );
+        int puff_chance = 24;
         if( has_flag( flag_TOBACCO ) ) {
-            carrier->add_effect( effect_cig, duration );
+            // Try not to go over 5mg nicotine if we started at 0.
+            if( typeId() == itype_cigar_lit ) {
+                puff_chance = 36;
+            }
+            // Smokers reflexively puff more often if they need more nicotine.
+            if( carrier->vitamin_get( vitamin_nicotine ) < 5 ) {
+                puff_chance /= 6;
+            }
+            if( one_in( puff_chance ) ) {
+                carrier->vitamin_mod( vitamin_nicotine, 1 );
+                carrier->add_msg_if_player( m_neutral, _( "You take a puff of your %s." ), type_name() );
+            }
         } else {
-            carrier->add_effect( effect_weed_high, duration / 2 );
+            // Tamp down message spam.
+            if( one_in( 3 ) ) {
+                carrier->add_msg_if_player( m_neutral, _( "You take a puff of your %s." ), type_name() );
+            }
+            // Deliver a total of less than 10mg per joint on average.
+            if( one_in( 3 ) ) {
+                carrier->vitamin_mod( vitamin_cannabis, 1 );
+            }
         }
         carrier->mod_moves( -to_moves<int>( 1_seconds ) * 0.15 );
 
@@ -5223,21 +5281,6 @@ bool item::on_drop( const tripoint_bub_ms &pos )
 bool item::on_drop( const tripoint_bub_ms &pos, map &m )
 {
     avatar &player_character = get_avatar();
-    if( cata::lua_ui::dispatch_native_consuming_callback(
-    "istate", typeId().str(), "on_drop", {
-    {
-        "character",
-        static_cast<const Character *>( &player_character )
-        },
-        { "item", static_cast<const item *>( this ) },
-        {
-            "position", cata::lua_ui::native_callback_point {
-                "bub_ms", tripoint_rel_ms( pos.x(), pos.y(), pos.z() )
-            }
-        }
-    } ) ) {
-        return true;
-    }
 
     // dropping liquids, even currently frozen ones, on the ground makes them
     // dirty

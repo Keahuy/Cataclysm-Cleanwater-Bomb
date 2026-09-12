@@ -1,6 +1,9 @@
+#include <subbodypart.h>
+#include <weakpoint.h>
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <list>
 #include <map>
@@ -20,16 +23,14 @@
 #include "bodypart.h"
 #include "calendar.h"
 #include "cata_utility.h"
-#include "catalua_lua_call.h"
-#include "catalua_ui.h"
 #include "character.h"
 #include "character_attire.h"
 #include "color.h"
 #include "coordinates.h"
 #include "creature.h"
 #include "creature_tracker.h"
-#include "debug.h"
 #include "damage.h"
+#include "debug.h"
 #include "dialogue.h"
 #include "effect.h"
 #include "effect_on_condition.h"
@@ -44,6 +45,7 @@
 #include "item.h"
 #include "item_location.h"
 #include "lightmap.h"
+#include "lua_platform_hooks.h"
 #include "magic.h"
 #include "magic_enchantment.h"
 #include "map.h"
@@ -82,6 +84,8 @@ static const bionic_id bio_power_weakness( "bio_power_weakness" );
 static const bionic_id bio_radleak( "bio_radleak" );
 static const bionic_id bio_sleep_shutdown( "bio_sleep_shutdown" );
 static const bionic_id bio_synlungs( "bio_synlungs" );
+
+static const damage_type_id damage_bash( "bash" );
 
 static const efftype_id effect_adrenaline( "adrenaline" );
 static const efftype_id effect_asthma( "asthma" );
@@ -126,7 +130,6 @@ static const itype_id itype_oxygen_tank( "oxygen_tank" );
 static const itype_id itype_smoxygen_tank( "smoxygen_tank" );
 
 static const json_character_flag json_flag_ALBINO( "ALBINO" );
-static const json_character_flag json_flag_REBREATHER_INTERNAL( "REBREATHER_INTERNAL" );
 static const json_character_flag json_flag_DAYFEAR( "DAYFEAR" );
 static const json_character_flag json_flag_ETHEREAL( "ETHEREAL" );
 static const json_character_flag json_flag_GILLS( "GILLS" );
@@ -137,15 +140,12 @@ static const json_character_flag json_flag_MEND_LIMB( "MEND_LIMB" );
 static const json_character_flag json_flag_NYCTOPHOBIA( "NYCTOPHOBIA" );
 static const json_character_flag json_flag_PAIN_IMMUNE( "PAIN_IMMUNE" );
 static const json_character_flag json_flag_RAD_DETECT( "RAD_DETECT" );
+static const json_character_flag json_flag_REBREATHER_INTERNAL( "REBREATHER_INTERNAL" );
 static const json_character_flag json_flag_SUFFOCATION_IMMUNE( "SUFFOCATION_IMMUNE" );
 static const json_character_flag json_flag_SUNBURN( "SUNBURN" );
 static const json_character_flag json_flag_SUNBURN_SUPERNATURAL( "SUNBURN_SUPERNATURAL" );
 static const json_character_flag
 json_flag_SUNBURN_SUPERNATURAL_REDUCTION( "SUNBURN_SUPERNATURAL_REDUCTION" );
-
-static const damage_type_id damage_bash( "bash" );
-static const sub_bodypart_str_id sub_body_part_torso_upper( "torso_upper" );
-static const sub_bodypart_str_id sub_body_part_torso_neck( "torso_neck" );
 
 static const morale_type morale_feeling_bad( "morale_feeling_bad" );
 static const morale_type morale_feeling_good( "morale_feeling_good" );
@@ -154,6 +154,10 @@ static const morale_type morale_pyromania_nearfire( "morale_pyromania_nearfire" 
 static const morale_type morale_pyromania_nofire( "morale_pyromania_nofire" );
 static const morale_type morale_pyromania_startfire( "morale_pyromania_startfire" );
 static const morale_type morale_wet( "morale_wet" );
+
+static const sub_bodypart_str_id sub_body_part_head_throat( "head_throat" );
+static const sub_bodypart_str_id sub_body_part_torso_neck( "torso_neck" );
+static const sub_bodypart_str_id sub_body_part_torso_upper( "torso_upper" );
 
 static const trait_id trait_ADDICTIVE( "ADDICTIVE" );
 static const trait_id trait_ASTHMA( "ASTHMA" );
@@ -328,12 +332,12 @@ void suffer::mutation_power( Character &you, const trait_id &mut_id )
             d.set_value( "this", mut_id.str() );
             eoc->activate_activation_only( d, "a mutation process", "mutation being activated", "mutation" );
         }
-        for( const cata::lua_ui::lua_call &call : mut_id->processed_luas ) {
-            cata::lua_ui::invoke_lua_call( call, "mutation_processed", {
-                { "character", static_cast<const Character *>( &you ) },
-                { "mutation", cata::lua_ui::native_callback_id{ "mutation", mut_id.str() } }
-            } );
-        }
+        cata::lua_platform::dispatch_native_hook( "on_mutation_processed", {
+            { "character", static_cast<const Character *>( &you ) },
+            { "mutation", cata::lua_platform::native_callback_id{ "mutation", mut_id.str() } },
+            { "activation_cost", static_cast<std::int64_t>( mut_id->cost ) },
+            { "cooldown_turns", static_cast<std::int64_t>( to_turns<int>( mut_id->cooldown ) ) }
+        } );
     }
 }
 
@@ -420,7 +424,7 @@ void suffer::while_grabbed( Character &you )
                           crowd_pressure / ( crowd - impassable_ter ) );
     }
 
-    const float pressure_per_part = crowd_pressure / 4;
+    const float pressure_per_part = crowd_pressure / 3;
     bool pressure_absorbed = true;
     const auto absorb_bodypart_pressure = [&]( const bodypart_id & bp, float pressure_amount ) {
         damage_instance pressure( damage_bash, pressure_amount );
@@ -429,18 +433,24 @@ void suffer::while_grabbed( Character &you )
             pressure_absorbed = false;
         }
     };
-    const auto absorb_sub_bodypart_pressure = [&]( const sub_bodypart_id & sbp, float pressure_amount,
-    bool allow_torso_neck_fallback = false ) {
+    const auto absorb_sub_bodypart_pressure = [&]( const sub_bodypart_id & sbp,
+    float pressure_amount ) {
         damage_instance pressure( damage_bash, pressure_amount );
-        you.absorb_hit( sbp, pressure, allow_torso_neck_fallback, false );
+        you.absorb_hit( sbp, pressure, false );
         if( pressure.total_damage() > 0.0f ) {
-            pressure_absorbed = false;
+            if( sbp == sub_body_part_head_throat.id() ) {
+                you.absorb_hit( sub_body_part_torso_neck.id(), pressure, false );
+                if( pressure.total_damage() > 0.0f ) {
+                    pressure_absorbed = false;
+                }
+            } else {
+                pressure_absorbed = false;
+            }
         }
     };
     absorb_sub_bodypart_pressure( sub_body_part_torso_upper.id(), pressure_per_part );
-    absorb_sub_bodypart_pressure( sub_body_part_torso_neck.id(), pressure_per_part, true );
+    absorb_sub_bodypart_pressure( sub_body_part_head_throat.id(), pressure_per_part );
     absorb_bodypart_pressure( body_part_mouth.id(), pressure_per_part );
-    absorb_bodypart_pressure( body_part_eyes.id(), pressure_per_part );
 
     if( pressure_absorbed ) {
         return;
@@ -484,6 +494,12 @@ void suffer::from_addictions( Character &you )
         timer = -3_hours;
     }
     for( addiction &cur_addiction : you.addictions ) {
+        for( const efftype_id &effect : cur_addiction.type->get_satisfying_effects() ) {
+            if( you.has_effect( effect ) ) {
+                cur_addiction.sated = cur_addiction.type->get_default_sated();
+                break;
+            }
+        }
         if( cur_addiction.sated <= 0_turns &&
             cur_addiction.intensity >= MIN_ADDICTION_LEVEL ) {
             if( uistate.distraction_withdrawal && !you.is_npc() ) {
@@ -1775,8 +1791,7 @@ void Character::suffer()
             suffer::water_damage( *this );
         }
         if( has_active_mutation( mut_id ) || ( !mut_id->activated &&
-                                               ( !mut_id->processed_eocs.empty() ||
-                                                       !mut_id->processed_luas.empty() ) ) ) {
+                                               !mut_id->processed_eocs.empty() ) ) {
             suffer::mutation_power( *this, mut_id );
         }
     }
@@ -2144,7 +2159,7 @@ void Character::apply_wetness_morale( units::temperature temperature )
 
     // Sensitivity scales how much being wet affects morale, ±50% across 0..500.
     const double sens_mult = clamp( 1.0 + 0.5 * std::log( std::clamp( get_sensitive(), 1,
-                                           500 ) / 100.0 ) / std::log( 5.0 ), 0.5, 1.5 );
+                                    500 ) / 100.0 ) / std::log( 5.0 ), 0.5, 1.5 );
     const int scaled_effect = round( morale_effect * sens_mult );
     if( scaled_effect != 0 || morale_effect == 0 ) {
         morale_effect = scaled_effect;

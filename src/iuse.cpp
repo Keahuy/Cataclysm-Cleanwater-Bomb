@@ -1,5 +1,6 @@
 #include "iuse.h"
 
+#include <clone_ptr.h>
 #include <algorithm>
 #include <array>
 #include <climits>
@@ -123,8 +124,8 @@
 #include "trap.h"
 #include "try_parse_integer.h"
 #include "type_id.h"
-#include "uilist.h"
 #include "ui_manager.h"
+#include "uilist.h"
 #include "units.h"
 #include "units_utility.h"
 #include "value_ptr.h"
@@ -144,7 +145,6 @@ static const activity_id ACT_PICKAXE( "ACT_PICKAXE" );
 static const addiction_id addiction_marloss_b( "marloss_b" );
 static const addiction_id addiction_marloss_r( "marloss_r" );
 static const addiction_id addiction_marloss_y( "marloss_y" );
-static const addiction_id addiction_nicotine( "nicotine" );
 
 static const ammotype ammo_battery( "battery" );
 
@@ -176,7 +176,6 @@ static const efftype_id effect_bloodworms( "bloodworms" );
 static const efftype_id effect_boomered( "boomered" );
 static const efftype_id effect_bouldering( "bouldering" );
 static const efftype_id effect_brainworms( "brainworms" );
-static const efftype_id effect_cig( "cig" );
 static const efftype_id effect_conjunctivitis( "conjunctivitis" );
 static const efftype_id effect_contacts( "contacts" );
 static const efftype_id effect_corroding( "corroding" );
@@ -212,7 +211,6 @@ static const efftype_id effect_music( "music" );
 static const efftype_id effect_nausea( "nausea" );
 static const efftype_id effect_onfire( "onfire" );
 static const efftype_id effect_paincysts( "paincysts" );
-static const efftype_id effect_pet( "pet" );
 static const efftype_id effect_poison( "poison" );
 static const efftype_id effect_ridden( "ridden" );
 static const efftype_id effect_riding( "riding" );
@@ -405,7 +403,9 @@ static const trap_str_id tr_goo( "tr_goo" );
 static const trap_str_id tr_portal( "tr_portal" );
 
 static const vitamin_id vitamin_blood( "blood" );
+static const vitamin_id vitamin_cannabis( "cannabis" );
 static const vitamin_id vitamin_human_blood_vitamin( "human_blood_vitamin" );
+static const vitamin_id vitamin_nicotine( "nicotine" );
 static const vitamin_id vitamin_redcells( "redcells" );
 
 static const weather_type_id weather_portal_storm( "portal_storm" );
@@ -540,21 +540,14 @@ std::optional<int> iuse::smoking( Character *p, item *it, const tripoint_bub_ms 
     if( it->typeId() == itype_cig || it->typeId() == itype_handrolled_cig ) {
         cig = item( itype_cig_lit, calendar::turn );
         cig.item_counter = to_turns<int>( 4_minutes );
-        p->mod_hunger( -3 );
-        p->mod_thirst( 2 );
     } else if( it->typeId() == itype_cigar ) {
         cig = item( itype_cigar_lit, calendar::turn );
-        cig.item_counter = to_turns<int>( 30_minutes );
-        p->mod_thirst( 3 );
-        p->mod_hunger( -4 );
+        cig.item_counter = to_turns<int>( 12_minutes );
     } else if( it->typeId() == itype_joint ) {
         cig = item( itype_joint_lit, calendar::turn );
         cig.item_counter = to_turns<int>( 4_minutes );
-        p->mod_hunger( 4 );
-        p->mod_thirst( 6 );
-        if( p->get_painkiller() < 5 ) {
-            p->set_painkiller( ( p->get_painkiller() + 3 ) * 2 );
-        }
+        p->add_effect( effect_weed_high, 5_minutes );
+        p->vitamin_mod( vitamin_cannabis, 2 );
     } else {
         p->add_msg_if_player( m_bad,
                               _( "Please let the devs know you should be able to smoke a %s, but the smoking code does not know how." ),
@@ -574,11 +567,6 @@ std::optional<int> iuse::smoking( Character *p, item *it, const tripoint_bub_ms 
             weed_msg( *p );
         }
     }
-    if( p->get_effect_dur( effect_cig ) > 10_minutes * ( p->addiction_level(
-                addiction_nicotine ) + 1 ) ) {
-        p->add_msg_if_player( m_bad, _( "Ugh, too much smoke… you feel nasty." ) );
-    }
-
     return 1;
 }
 
@@ -605,13 +593,7 @@ std::optional<int> iuse::ecig( Character *p, item *it, const tripoint_bub_ms & )
         }
     }
 
-    p->mod_thirst( 1 );
-    p->mod_hunger( -1 );
-    p->add_effect( effect_cig, 10_minutes );
-    if( p->get_effect_dur( effect_cig ) > 10_minutes * ( p->addiction_level(
-                addiction_nicotine ) + 1 ) ) {
-        p->add_msg_if_player( m_bad, _( "Ugh, too much nicotine… you feel nasty." ) );
-    }
+    p->vitamin_mod( vitamin_nicotine, 2 );
     return 1;
 }
 
@@ -803,30 +785,6 @@ std::optional<int> iuse::anticonvulsant( Character *p, item *, const tripoint_bu
     if( p->has_effect( effect_shakes ) ) {
         p->remove_effect( effect_shakes );
         p->add_msg_if_player( m_good, _( "You stop shaking." ) );
-    }
-    return 1;
-}
-
-std::optional<int> iuse::weed_cake( Character *p, item *, const tripoint_bub_ms & )
-{
-    p->add_msg_if_player(
-        _( "You start scarfing down the delicious cake.  It tastes a little funny, though…" ) );
-    time_duration duration = 12_minutes;
-    if( p->has_trait( trait_TOLERANCE ) ) {
-        duration = 9_minutes;
-    }
-    if( p->has_trait( trait_LIGHTWEIGHT ) ) {
-        duration = 15_minutes;
-    }
-    p->mod_hunger( 2 );
-    p->mod_thirst( 6 );
-    if( p->get_painkiller() < 5 ) {
-        p->set_painkiller( ( p->get_painkiller() + 3 ) * 2 );
-    }
-    p->add_effect( effect_weed_high, duration );
-    p->mod_moves( -to_moves<int>( 1_seconds ) );
-    if( one_in( 5 ) ) {
-        weed_msg( *p );
     }
     return 1;
 }
@@ -3770,9 +3728,9 @@ void iuse::make_music( Character *p, const tripoint_bub_ms &source, int volume, 
     }
     p->add_effect( effect_music, 1_turns );
     if( max_morale > 0 ) {
-        p->add_morale( morale_music, 1, max_morale, 2_hours, 30_minutes );
+        p->add_morale( morale_music, 1, max_morale, 2_hours, 30_minutes, true );
     } else if( max_morale < 0 ) {
-        p->add_morale( morale_music, -1, max_morale, 2_hours, 30_minutes );
+        p->add_morale( morale_music, -1, max_morale, 2_hours, 30_minutes, true );
     }
 }
 
@@ -7748,7 +7706,7 @@ std::optional<int> iuse::multicooker( Character *p, item *it, const tripoint_bub
                 for( const recipe * const &rec : recipes_to_add ) {
                     dishes.push_back( rec );
                     const bool can_make = rec->deduped_requirements().can_make_with_inventory(
-                                              crafting_inv, rec->get_component_filter() );
+                                              p, crafting_inv, rec->get_component_filter() );
                     dmenu.addentry( counter++, can_make, -1, rec->result_name( /*decorated=*/true ) );
                 }
             }

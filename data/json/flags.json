@@ -98,18 +98,6 @@
     "info": "This gear has <info>cloaking tech</info> that will <good>make you invisible</good> when active, at the cost of <info>power from a UPS</info>."
   },
   {
-    "id": "ALCOHOL",
-    "type": "json_flag"
-  },
-  {
-    "id": "ALCOHOL_STRONG",
-    "type": "json_flag"
-  },
-  {
-    "id": "ALCOHOL_WEAK",
-    "type": "json_flag"
-  },
-  {
     "id": "ALLOWS_TAIL",
     "type": "json_flag"
   },
@@ -274,6 +262,10 @@
     "info": "While wielded, this item allows you to mine through rocks and other hard obstacles by moving into tiles with them.  Note that automatic mining option should be set to true for this to work."
   },
   {
+    "id": "DURABLE",
+    "type": "json_flag"
+  },
+  {
     "id": "DURABLE_MELEE",
     "type": "json_flag",
     "info": "As a weapon, this item is <good>well-made</good> and will <info>withstand the punishment of combat</info>.",
@@ -378,6 +370,11 @@
     "id": "HUNGER_DISRUPTION",
     "type": "json_flag",
     "info": "You don't know how hungry you are when you are effected by this."
+  },
+  {
+    "id": "CANNOT_CONSUME_DRUGS",
+    "type": "json_flag",
+    "info": "You cannot use any item with the consume_drug use_action when you have this flag."
   },
   {
     "id": "ELECTRIC_IMMUNE",
@@ -2578,6 +2575,11 @@
     "id": "SUNBURN_SUPERNATURAL_REDUCTION",
     "type": "json_flag",
     "info": "You burn in the sunlight like a vampire, but not quite as badly."
+  },
+  {
+    "id": "DISTRIBUTED_DAMAGE",
+    "type": "json_flag",
+    "info": "Damage you take is split evenly between your limbs"
   },
   {
     "id": "SHREDDED",

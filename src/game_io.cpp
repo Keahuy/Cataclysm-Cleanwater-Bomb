@@ -37,8 +37,7 @@
 #include "cata_utility.h"
 #include "cata_variant.h"
 #include "catacharset.h"
-#include "catalua_platform.h"
-#include "catalua_ui.h"
+#include "lua_platform_loader.h"
 #include "char_validity_check.h"
 #include "character.h"
 #include "character_id.h"
@@ -67,6 +66,7 @@
 #include "mapbuffer.h"
 #include "memorial_logger.h"
 #include "messages.h"
+#include "mod_id_compat.h"
 #include "mod_manager.h"
 #include "mp_gamestate.h"
 #include "options.h"
@@ -101,7 +101,7 @@
 
 static const dimension_id dimension_world_default( "default" );
 
-static const mod_id MOD_INFORMATION_dda( "dda" );
+static const mod_id MOD_INFORMATION_ccb( "ccb" );
 
 #define dbg(x) DebugLog((x),D_GAME) << __FILE__ << ":" << __LINE__ << ": "
 
@@ -249,22 +249,6 @@ bool game::check_mod_data( const std::vector<mod_id> &opts )
                                           platform_error );
             }
 
-            std::vector<std::string> lua_mod_ids;
-            lua_mod_ids.reserve( dep_vector.size() + 1 );
-            std::set<std::string> seen_lua_mod_ids;
-            for( const mod_id &dep : dep_vector ) {
-                if( seen_lua_mod_ids.insert( dep.str() ).second ) {
-                    lua_mod_ids.push_back( dep.str() );
-                }
-            }
-            if( seen_lua_mod_ids.insert( mod.ident.str() ).second ) {
-                lua_mod_ids.push_back( mod.ident.str() );
-            }
-            std::string lua_error;
-            if( !cata::lua_ui::validate_mod_scripts( lua_mod_ids, lua_error ) ) {
-                std::cerr << "Error loading Lua Mod scripts: " << lua_error << std::endl;
-                mod_valid = false;
-            }
         } catch( const std::exception &err ) {
             std::cerr << "Error loading data: " << err.what() << std::endl;
             mod_valid = false;
@@ -538,10 +522,6 @@ bool game::load( const save_t &name )
                     if constexpr( cata::lua_platform::is_enabled() ) {
                         cata::lua_platform::on_world_ready( false );
                     }
-                    if constexpr( cata::lua_ui::is_enabled() ) {
-                        cata::lua_ui::on_world_ready(
-                            cata::lua_ui::world_ready_kind::loaded_game );
-                    }
                     events().send<event_type::game_load>( getVersionString() );
                     time_of_last_load = std::chrono::steady_clock::now();
                     time_played_at_last_load = std::chrono::seconds( 0 );
@@ -590,22 +570,13 @@ void game::load_world_modfiles()
 {
     auto &mods = world_generator->active_world->active_mod_order;
 
-    // remove any duplicates whilst preserving order (fixes #19385)
-    std::set<mod_id> found;
-    mods.erase( std::remove_if( mods.begin(), mods.end(), [&found]( const mod_id & e ) {
-        if( found.count( e ) ) {
-            return true;
-        } else {
-            found.insert( e );
-            return false;
-        }
-    } ), mods.end() );
+    canonicalize_mod_list( mods );
 
     // require at least one core mod (saves before version 6 may implicitly require dda pack)
     if( std::none_of( mods.begin(), mods.end(), []( const mod_id & e ) {
     return e->core;
 } ) ) {
-        mods.insert( mods.begin(), MOD_INFORMATION_dda );
+        mods.insert( mods.begin(), MOD_INFORMATION_ccb );
     }
 
     // this code does not care about mod dependencies,
@@ -644,7 +615,9 @@ void game::load_world_modfiles()
 
 void game::load_packs( const std::string &msg, const std::vector<mod_id> &packs )
 {
-    for( const auto &mod : packs ) {
+    auto canonical_packs = packs;
+    canonicalize_mod_list( canonical_packs );
+    for( const auto &mod : canonical_packs ) {
         // Suppress missing mods the player chose to leave in the modlist
         if( !mod.is_valid() ) {
             continue;
@@ -659,7 +632,7 @@ void game::load_packs( const std::string &msg, const std::vector<mod_id> &packs 
     }
     cata_timer::print_stats();
 
-    for( const auto &mod : packs ) {
+    for( const auto &mod : canonical_packs ) {
         if( !mod.is_valid() ) {
             continue;
         }
@@ -832,8 +805,17 @@ bool game::save_external_options_record()
     return saved_externals;
 }
 
+// Saving can pump UI events. These guards cover nested callbacks even if a
+// callback tries to enter through a different save entry point.
+static bool save_in_progress = false;
+
 bool game::save()
 {
+    if( save_in_progress ) {
+        return false;
+    }
+    restore_on_out_of_scope restore_saving( save_in_progress );
+    save_in_progress = true;
     // total_time_played accumulates real wall-clock seconds, which is inherently
     // non-deterministic. Under input replay we freeze the delta at 0 so the
     // persisted playtime (written to both .pt and the character .sav) is
@@ -847,9 +829,6 @@ bool game::save()
     std::chrono::seconds total_time_played = time_played_at_last_load + time_since_load;
     if constexpr( cata::lua_platform::is_enabled() ) {
         cata::lua_platform::before_save();
-    }
-    if constexpr( cata::lua_ui::is_enabled() ) {
-        cata::lua_ui::on_game_save();
     }
     events().send<event_type::game_save>( time_since_load, total_time_played );
     try {
@@ -883,13 +862,6 @@ bool game::save()
                     add_msg( m_warning,
                              _( "Game saved, but Lua-first Platform state could not be saved: %s" ),
                              platform_state_error );
-                }
-            }
-            if constexpr( cata::lua_ui::is_enabled() ) {
-                std::string lua_state_error;
-                if( !cata::lua_ui::save_persistent_state( lua_state_error ) ) {
-                    add_msg( m_warning, _( "Game saved, but Lua UI state could not be saved: %s" ),
-                             lua_state_error );
                 }
             }
             world_generator->last_world_name = world_generator->active_world->world_name;
@@ -1028,6 +1000,16 @@ void game::init_autosave()
 
 void game::quicksave()
 {
+    static bool quicksave_in_progress = false;
+    // Android can pump focus events from loading screens and save popups.
+    // Only save a running session, never a half-loaded avatar/map or a save
+    // already in progress. Check this here so every quicksave caller is safe.
+    if( !world_generator || !world_generator->active_world || new_game ||
+        !should_draw || uquit != QUIT_NO || save_in_progress || quicksave_in_progress ) {
+        return;
+    }
+    restore_on_out_of_scope restore_quicksaving( quicksave_in_progress );
+    quicksave_in_progress = true;
     //Don't autosave if the player hasn't done anything since the last autosave/quicksave,
     if( !moves_since_last_save && !world_generator->active_world->world_saves.empty() ) {
         return;
@@ -1043,7 +1025,9 @@ void game::quicksave()
     time_t now = std::time( nullptr ); //timestamp for start of saving procedure
 
     //perform save
-    save();
+    if( !save() ) {
+        return;
+    }
     //Now reset counters for autosaving, so we don't immediately autosave after a quicksave or autosave.
     moves_since_last_save = 0;
     last_save_timestamp = now;

@@ -42,7 +42,6 @@
 #endif
 #include "cata_utility.h"
 #include "catacharset.h"
-#include "catalua_ui.h"
 #include "character.h"
 #include "character_attire.h"
 #include "character_id.h"
@@ -63,7 +62,6 @@
 #include "effect.h"
 #include "effect_on_condition.h"
 #include "end_screen.h"
-#include "enum_conversions.h"
 #include "enums.h"
 #include "event.h"
 #include "event_bus.h"
@@ -86,6 +84,8 @@
 #include "json.h"
 #include "list.h"
 #include "localized_comparator.h"
+#include "lua_platform_hooks.h"
+#include "lua_platform_loader.h"
 #include "magic.h"
 #include "map.h"
 #include "map_extras.h"
@@ -308,12 +308,10 @@ std::string enum_to_string<debug_menu::debug_menu_index>( debug_menu::debug_menu
 		case debug_menu::debug_menu_index::WRITE_CITY_LIST: return "WRITE_CITY_LIST";
         case debug_menu::debug_menu_index::TALK_TOPIC: return "TALK_TOPIC";
         case debug_menu::debug_menu_index::IMGUI_DEMO: return "IMGUI_DEMO";
-#if defined(CATA_ENABLE_LUA_UI) && CATA_ENABLE_LUA_UI
-        case debug_menu::debug_menu_index::LUA_UI: return "LUA_UI";
-#endif
         case debug_menu::debug_menu_index::VEHICLE_EFFECTS: return "VEHICLE_EFFECTS";
         case debug_menu::debug_menu_index::WISHPROFICIENCY: return "WISHPROFICIENCY";
         case debug_menu::debug_menu_index::RELOAD_GPU_SHADERS: return "RELOAD_GPU_SHADERS";
+        case debug_menu::debug_menu_index::RELOAD_LUA_SCRIPTS: return "RELOAD_LUA_SCRIPTS";
         // *INDENT-ON*
         case debug_menu::debug_menu_index::last:
             break;
@@ -1016,9 +1014,6 @@ static int info_uilist()
         { uilist_entry( debug_menu_index::GENERATE_EFFECT_LIST, true, 'L', _( "Generate effect list" ) ) },
         { uilist_entry( debug_menu_index::WRITE_CITY_LIST, true, 'C', _( "Write city list to cities.output" ) ) },
         { uilist_entry( debug_menu_index::IMGUI_DEMO, true, 'u', _( "Open ImGui demo screen" ) ) },
-#if defined(CATA_ENABLE_LUA_UI) && CATA_ENABLE_LUA_UI
-        { uilist_entry( debug_menu_index::LUA_UI, true, 'L', _( "Open Lua UI pages" ) ) },
-#endif
 #if defined(TILES) && defined(USE_SDL3)
         { uilist_entry( debug_menu_index::RELOAD_GPU_SHADERS, true, 'P', _( "Reload GPU shaders" ) ) },
 #endif
@@ -1039,6 +1034,10 @@ static int game_uilist()
         { uilist_entry( debug_menu_index::QUIT_NOSAVE, true, 'Q', _( "Quit to main menu" ) )  },
         { uilist_entry( debug_menu_index::QUICKLOAD, true, 'q', _( "Quickload" ) )  },
         { uilist_entry( debug_menu_index::SNAPSHOT_MENU, true, 'n', _( "Snapshot save/load menu" ) )  },
+        {
+            uilist_entry( debug_menu_index::RELOAD_LUA_SCRIPTS,
+                          cata::lua_platform::is_enabled(), 'l', _( "Reload Lua Mod scripts" ) )
+        },
     };
 
     return uilist( _( "Game…" ), uilist_initializer );
@@ -1427,11 +1426,11 @@ static void spell_description(
 
     if( spl.has_components() ) {
         if( !spl.components().get_components().empty() ) {
-            print_vec_string( spl.components().get_folded_components_list( width - 2, gray,
+            print_vec_string( spl.components().get_folded_components_list( &chrc, width - 2, gray,
                               chrc.crafting_inventory(), return_true<item> ) );
         }
         if( !( spl.components().get_tools().empty() && spl.components().get_qualities().empty() ) ) {
-            print_vec_string( spl.components().get_folded_tools_list( width - 2, gray,
+            print_vec_string( spl.components().get_folded_tools_list( &chrc, width - 2, gray,
                               chrc.crafting_inventory() ) );
         }
     }
@@ -3706,7 +3705,7 @@ static void import_folower()
         temp->spawn_at_precise( get_avatar().pos_abs() + point( -4, -4 ) );
         overmap_buffer.insert_npc( temp );
         g->load_npcs();
-        cata::lua_ui::dispatch_native_npc_spawn(
+        cata::lua_platform::dispatch_native_npc_spawn(
             *temp, "debug_import" );
     } catch( const std::exception &err ) {
         debugmsg( _( "Failed to read NPC: %s" ), err.what() );
@@ -3867,7 +3866,7 @@ static void spawn_npc()
                             faction_id( new_fac_id ), faction_no_faction );
     temp->set_fac( new_solo_fac ? new_solo_fac->id : faction_no_faction );
     g->load_npcs();
-    cata::lua_ui::dispatch_native_npc_spawn( *temp, "debug" );
+    cata::lua_platform::dispatch_native_npc_spawn( *temp, "debug" );
 }
 
 static void spawn_npc_follower()
@@ -3886,7 +3885,7 @@ static void spawn_npc_follower()
     temp->add_new_mission( mission::reserve_random( ORIGIN_ANY_NPC, temp->pos_abs_omt(),
                            temp->getID() ) );
     g->load_npcs();
-    cata::lua_ui::dispatch_native_npc_spawn(
+    cata::lua_platform::dispatch_native_npc_spawn(
         *temp, "debug_follower" );
 }
 
@@ -3927,7 +3926,7 @@ static void spawn_named_npc()
         temp->form_opinion( player_character );
 
         g->load_npcs();
-        cata::lua_ui::dispatch_native_npc_spawn(
+        cata::lua_platform::dispatch_native_npc_spawn(
             *temp, "debug_template" );
     }
 
@@ -4995,14 +4994,34 @@ const std::vector<debug_action_entry> &all_actions()
                 run_imgui_demo();
             }
         },
-#if defined(CATA_ENABLE_LUA_UI) && CATA_ENABLE_LUA_UI
         {
-            debug_menu_index::LUA_UI, translate_marker( "Lua UI pages" ), "lua script ui", "Game", []()
+            debug_menu_index::RELOAD_LUA_SCRIPTS, translate_marker( "Reload Lua Mod scripts" ),
+            "reload lua mod scripts platform", "Game", []()
             {
-                cata::lua_ui::show_slot( "debug.tools" );
+                if( !cata::lua_platform::is_enabled() ) {
+                    popup( _( "This build does not include Lua Platform support." ) );
+                    return;
+                }
+                const std::vector<std::string> mods = cata::lua_platform::loaded_mod_ids();
+                if( mods.empty() ) {
+                    popup( _( "No Lua Mods are active in this world." ) );
+                    return;
+                }
+                std::string error;
+                if( !cata::lua_platform::reload_active_mods( error ) ) {
+                    if( error.find( "requires_full_data_reload:" ) == 0 ) {
+                        popup( _( "Lua static content changed.  Restart the game to reload its definitions.  "
+                                  "The previous script registrations remain active.\n\n%s" ), error );
+                    } else {
+                        popup( _( "Lua script reload failed.  The previous script registrations remain "
+                                  "active.\n\n%s" ), error );
+                    }
+                    return;
+                }
+                add_msg( m_info, _( "Replaced Lua script registrations for %zu Mods.  "
+                                    "Check the message log for callback errors." ), mods.size() );
             }
         },
-#endif
         {
             debug_menu_index::RELOAD_GPU_SHADERS, translate_marker( "Reload GPU shaders" ), "reload gpu shaders sdl3", "Game", []()
             {

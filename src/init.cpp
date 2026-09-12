@@ -1,7 +1,10 @@
 #include "init.h"
 
+#include <cata_path.h>
+#include <memory_fast.h>
 #include <algorithm>
 #include <cstddef>
+#include <exception>
 #include <filesystem>
 #include <memory>
 #include <sstream>
@@ -49,7 +52,6 @@
 #include "faction_camp.h"
 #include "fault.h"
 #include "field_type.h"
-#include "mapgen_post_process.h"
 #include "filesystem.h"
 #include "flag.h"
 #include "flexbuffer_json.h"
@@ -74,10 +76,12 @@
 #include "map_extras.h"
 #include "mapdata.h"
 #include "mapgen.h"
+#include "mapgen_post_process.h"
 #include "martialarts.h"
 #include "material.h"
 #include "math_parser_jmath.h"
 #include "mission.h"
+#include "mod_id_compat.h"
 #include "mod_manager.h"
 #include "mod_tileset.h"
 #include "monfaction.h"
@@ -186,7 +190,7 @@ shared_ptr_fast<std::istream> DynamicDataLoader::get_cached_stream( const std::s
     return cached;
 }
 
-void DynamicDataLoader::load_deferred( deferred_json &data )
+void DynamicDataLoader::load_deferred( deferred_json &data, bool final_pass )
 {
     while( !data.empty() ) {
         const size_t n = data.size();
@@ -204,6 +208,9 @@ void DynamicDataLoader::load_deferred( deferred_json &data )
         }
         data.erase( data.begin(), it );
         if( data.size() == n ) {
+            if( !final_pass ) {
+                return;
+            }
             for( const auto &elem : data ) {
                 scoped_debug_error_source error_source( get_mod_error_source( elem.second ) );
                 try {
@@ -547,9 +554,6 @@ void DynamicDataLoader::load_data_from_path( const cata_path &path, const std::s
 
     // iterate over each file
     for( const cata_path &file : files ) {
-        if( file == path / "lua" / "manifest.json" ) {
-            continue;
-        }
         scoped_debug_error_source error_source( get_mod_error_source( src ) );
         try {
             // parse it
@@ -586,9 +590,6 @@ void DynamicDataLoader::load_mod_data_from_path( const cata_path &path, const st
 
     // iterate over each file
     for( const cata_path &file : files ) {
-        if( file == path / "lua" / "manifest.json" ) {
-            continue;
-        }
         scoped_debug_error_source error_source( get_mod_error_source( src ) );
         try {
             // parse it
@@ -617,7 +618,8 @@ void DynamicDataLoader::load_mod_interaction_files_from_path( const cata_path &p
         const std::vector<cata_path> interaction_folders = get_directories( path, false );
 
         for( const cata_path &f : interaction_folders ) {
-            const mod_id associated_mod = mod_id( f.get_unrelative_path().filename().string() );
+            const mod_id associated_mod = canonical_mod_id( mod_id(
+                                              f.get_unrelative_path().filename().string() ) );
             bool is_mod_loaded = std::find( loaded_mods.begin(), loaded_mods.end(),
                                             associated_mod ) != loaded_mods.end();
 

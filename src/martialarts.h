@@ -30,6 +30,7 @@ enum class bp_type;
 namespace cata::lua_platform
 {
 class content_transaction;
+class items_content_transaction;
 } // namespace cata::lua_platform
 
 const matec_id tec_none( "tec_none" );
@@ -63,6 +64,7 @@ class weapon_category
         friend class generic_factory<weapon_category>;
         friend struct mod_tracker;
         friend class cata::lua_platform::content_transaction;
+        friend class cata::lua_platform::items_content_transaction;
 
         weapon_category_id id;
         std::vector<std::pair<weapon_category_id, mod_id>> src;
@@ -161,7 +163,11 @@ struct tech_effect_data {
     bool on_damage;
     int chance;
     std::string message;
+    // Legacy single-flag requirement retained for external mod compatibility.
     json_character_flag req_flag;
+    // Dialogue condition; `u` is the martial artist and `npc` is the target.
+    std::function<bool( const_dialogue const & )> condition;
+    bool has_condition = false;
 
     tech_effect_data( const efftype_id &nid, int dur, bool perm, bool ondmg,
                       int nchance, std::string message, json_character_flag req_flag ) :
@@ -177,6 +183,7 @@ class ma_technique
         void load( const JsonObject &jo, std::string_view src );
         static void verify_ma_techniques();
         static void finalize_all();
+        static const std::vector<ma_technique> &get_all();
         void check() const;
 
         matec_id id;
@@ -245,6 +252,10 @@ class ma_technique
         bonus_container bonuses;
 
         std::vector<tech_effect_data> tech_effects;
+
+        // Lua-first post-application callback owned by the defining mod.
+        std::string lua_platform_mod;
+        std::string lua_platform_apply_handler;
 
         float damage_bonus( const Character &u, const damage_type_id &type ) const;
         float damage_multiplier( const Character &u, const damage_type_id &type ) const;

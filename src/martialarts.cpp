@@ -1,6 +1,11 @@
 #include "martialarts.h"
 
+#include <bonuses.h>
+#include <calendar.h>
+#include <flat_set.h>
 #include <imgui/imgui.h>
+#include <translation.h>
+#include <type_id.h>
 #include <algorithm>
 #include <cstdlib>
 #include <iterator>
@@ -12,7 +17,6 @@
 
 #include "bodypart.h"
 #include "cata_imgui.h"
-#include "catalua_platform_content.h"
 #include "cata_utility.h"
 #include "character.h"
 #include "character_attire.h"
@@ -35,6 +39,8 @@
 #include "item_location.h"
 #include "itype.h"
 #include "localized_comparator.h"
+#include "lua_platform_content.h"
+#include "lua_platform_runtime.h"
 #include "messages.h"
 #include "output.h"
 #include "pimpl.h"
@@ -259,10 +265,15 @@ class ma_weapon_damage_reader : public generic_typed_reader<ma_weapon_damage_rea
 
 tech_effect_data load_tech_effect_data( const JsonObject &e )
 {
-    return tech_effect_data( efftype_id( e.get_string( "id" ) ), e.get_int( "duration", 0 ),
-                             e.get_bool( "permanent", false ), e.get_bool( "on_damage", true ),
-                             e.get_int( "chance", 100 ), e.get_string( "message", "" ),
-                             json_character_flag( e.get_string( "req_flag", "NULL" ) ) );
+    tech_effect_data ret( efftype_id( e.get_string( "id" ) ), e.get_int( "duration", 0 ),
+                          e.get_bool( "permanent", false ), e.get_bool( "on_damage", true ),
+                          e.get_int( "chance", 100 ), e.get_string( "message", "" ),
+                          json_character_flag( e.get_string( "req_flag", "NULL" ) ) );
+    if( e.has_member( "condition" ) ) {
+        read_condition( e, "condition", ret.condition, false );
+        ret.has_condition = true;
+    }
+    return ret;
 }
 
 namespace
@@ -373,6 +384,11 @@ void ma_technique::load( const JsonObject &jo, std::string_view src )
 void ma_technique::verify_ma_techniques()
 {
     ma_techniques.check();
+}
+
+const std::vector<ma_technique> &ma_technique::get_all()
+{
+    return ma_techniques.get_all();
 }
 
 void ma_technique::check() const
@@ -1364,56 +1380,67 @@ void martialart::activate_eocs( Character &u,
 void martialart::apply_static_eocs( Character &u ) const
 {
     activate_eocs( u, static_eocs );
+    cata::lua_platform::invoke_martial_art_handler( id.str(), "static", u );
 }
 
 void martialart::apply_onmove_eocs( Character &u ) const
 {
     activate_eocs( u, onmove_eocs );
+    cata::lua_platform::invoke_martial_art_handler( id.str(), "move", u );
 }
 
 void martialart::apply_onpause_eocs( Character &u ) const
 {
     activate_eocs( u, onpause_eocs );
+    cata::lua_platform::invoke_martial_art_handler( id.str(), "pause", u );
 }
 
 void martialart::apply_onhit_eocs( Character &u ) const
 {
     activate_eocs( u, onhit_eocs );
+    cata::lua_platform::invoke_martial_art_handler( id.str(), "hit", u );
 }
 
 void martialart::apply_onattack_eocs( Character &u ) const
 {
     activate_eocs( u, onattack_eocs );
+    cata::lua_platform::invoke_martial_art_handler( id.str(), "attack", u );
 }
 
 void martialart::apply_ondodge_eocs( Character &u ) const
 {
     activate_eocs( u, ondodge_eocs );
+    cata::lua_platform::invoke_martial_art_handler( id.str(), "dodge", u );
 }
 
 void martialart::apply_onblock_eocs( Character &u ) const
 {
     activate_eocs( u, onblock_eocs );
+    cata::lua_platform::invoke_martial_art_handler( id.str(), "block", u );
 }
 
 void martialart::apply_ongethit_eocs( Character &u ) const
 {
     activate_eocs( u, ongethit_eocs );
+    cata::lua_platform::invoke_martial_art_handler( id.str(), "gethit", u );
 }
 
 void martialart::apply_onmiss_eocs( Character &u ) const
 {
     activate_eocs( u, onmiss_eocs );
+    cata::lua_platform::invoke_martial_art_handler( id.str(), "miss", u );
 }
 
 void martialart::apply_oncrit_eocs( Character &u ) const
 {
     activate_eocs( u, oncrit_eocs );
+    cata::lua_platform::invoke_martial_art_handler( id.str(), "crit", u );
 }
 
 void martialart::apply_onkill_eocs( Character &u ) const
 {
     activate_eocs( u, onkill_eocs );
+    cata::lua_platform::invoke_martial_art_handler( id.str(), "kill", u );
 }
 
 bool martialart::has_technique( const Character &u, const matec_id &tec_id ) const

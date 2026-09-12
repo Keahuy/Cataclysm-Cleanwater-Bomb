@@ -4,6 +4,7 @@
 #include <array>
 #include <climits>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <functional>
 #include <limits>
@@ -21,9 +22,9 @@
 #include "bionics.h"
 #include "body_part_set.h"
 #include "bodypart.h"
+#include "cached_options.h"
 #include "calendar.h"
 #include "cata_utility.h"
-#include "catalua_ui.h"
 #include "character.h"
 #include "character_attire.h"
 #include "character_martial_arts.h"
@@ -49,6 +50,8 @@
 #include "item_location.h"
 #include "itype.h"
 #include "line.h"
+#include "lua_platform_hooks.h"
+#include "lua_platform_runtime.h"
 #include "magic.h"
 #include "magic_enchantment.h"
 #include "map.h"
@@ -478,8 +481,11 @@ void Character::roll_all_damage( bool crit, damage_instance &di, bool average,
     if( target != nullptr ) {
         crit_mod = target->get_crit_factor( bp );
     }
+    const float target_cut_armor = target ?
+                                   target->get_armor_type( damage_cut, bp ) : 0.0f;
     for( const damage_type &dt : damage_type::get_all() ) {
-        roll_damage( dt.id, crit, di, average, weap, attack_vector, contact, crit_mod );
+        roll_damage( dt.id, crit, di, average, weap, attack_vector, contact, crit_mod,
+                     target_cut_armor );
     }
 }
 
@@ -587,6 +593,18 @@ static const std::set<weapon_category_id> &wielded_weapon_categories( const Char
     return unarmed;
 }
 
+void Character::reduce_moves_from_attack( int forced_movecost, int move_cost )
+{
+    // Weariness handling - 1 / the value, because it returns what % of the normal speed
+    // Set the % move speed to the smaller of the modified speed or 100%, to avoid
+    // accelerating baseline attack speed if using a non-1 value for EXTRA_EXERCISE
+    const float weary_mult = std::min( combat_speed_modifier *
+                                       exertion_adjusted_move_multiplier(
+                                           EXTRA_EXERCISE ),
+                                       1.0f );
+    mod_moves( forced_movecost >= 0 ? -forced_movecost : -move_cost * ( 1 / weary_mult ) );
+}
+
 bool Character::melee_attack_abstract( Creature &t, bool allow_special,
                                        const matec_id &force_technique,
                                        bool allow_unarmed, int forced_movecost )
@@ -650,17 +668,6 @@ bool Character::melee_attack_abstract( Creature &t, bool allow_special,
     item cur_weap = cur_weapon ? *cur_weapon : null_item_reference();
 
     int move_cost = attack_speed( cur_weap );
-    const item *callback_weapon =
-        cur_weapon ? cur_weapon.get_item() : &cur_weap;
-    const bool callback_allows_hit =
-        cata::lua_ui::dispatch_native_callback(
-    "imelee", cur_weap.typeId().str(), "on_melee_attack", {
-        { "character", static_cast<const Character *>( this ) },
-        { "target", static_cast<const Creature *>( &t ) },
-        { "item", callback_weapon },
-        { "move_cost", std::int64_t { move_cost } }
-    } );
-
     if( cur_weap.attack_time( *this ) > move_cost * 20 ) {
         add_msg( m_bad, _( "This weapon is too unwieldy to attack with!" ) );
         return false;
@@ -688,7 +695,7 @@ bool Character::melee_attack_abstract( Creature &t, bool allow_special,
         }
     }
 
-    const bool hits = callback_allows_hit && hit_spread >= 0;
+    const bool hits = hit_spread >= 0;
 
     if( monster *m = t.as_monster() ) {
         cata::event e = cata::event::make<event_type::character_melee_attacks_monster>( getID(),
@@ -711,12 +718,6 @@ bool Character::melee_attack_abstract( Creature &t, bool allow_special,
                                  t.times_combatted_player <= 100;
     Character &player_character = get_player_character();
     if( !hits ) {
-        cata::lua_ui::dispatch_native_callback(
-        "imelee", cur_weap.typeId().str(), "on_miss", {
-            { "character", static_cast<const Character *>( this ) },
-            { "target", static_cast<const Creature *>( &t ) },
-            { "item", callback_weapon }
-        } );
         int stumble_pen = stumble( *this, cur_weapon );
         sfx::generate_melee_sound( cur_weap, pos_bub(), t.pos_bub(), false, false );
 
@@ -874,21 +875,6 @@ bool Character::melee_attack_abstract( Creature &t, bool allow_special,
             weakpoint_attack attack;
             attack.weapon = &cur_weap;
             t.deal_melee_hit( this, hit_spread, critical_hit, d, dealt_dam, attack, &target_bp );
-            callback_weapon =
-                cur_weapon ? cur_weapon.get_item() : &cur_weap;
-            cata::lua_ui::dispatch_native_callback(
-            "imelee", cur_weap.typeId().str(), "on_hit", {
-                { "character", static_cast<const Character *>( this ) },
-                { "target", static_cast<const Creature *>( &t ) },
-                { "item", callback_weapon },
-                {
-                    "damage", std::int64_t {
-                        dealt_dam.total_damage()
-                    }
-                },
-                { "critical", critical_hit }
-            } );
-
             bool has_edged_damage = false;
             for( const damage_type &dt : damage_type::get_all() ) {
                 if( dt.melee_only && dt.edged && dealt_special_dam.type_damage( dt.id ) > 0 ) {
@@ -997,13 +983,10 @@ bool Character::melee_attack_abstract( Creature &t, bool allow_special,
             practice_proficiency( prof, 1_seconds );
         }
     }
-
     burn_energy_arms( std::min( -50, total_stam + deft_bonus ) );
     add_msg_debug( debugmode::DF_MELEE, "Stamina burn base/total (capped at -50): %d/%d", base_stam,
                    total_stam + deft_bonus );
-    // Weariness handling - 1 / the value, because it returns what % of the normal speed
-    const float weary_mult = exertion_adjusted_move_multiplier( EXTRA_EXERCISE );
-    mod_moves( forced_movecost >= 0 ? -forced_movecost : -move_cost * ( 1 / weary_mult ) );
+    reduce_moves_from_attack( forced_movecost, move_cost );
     // trigger martial arts on-attack effects
     martial_arts_data->ma_onattack_effects( *this );
     // some things (shattering weapons) can harm the attacking creature.
@@ -1013,7 +996,7 @@ bool Character::melee_attack_abstract( Creature &t, bool allow_special,
         dealt_projectile_attack dp = dealt_projectile_attack();
         t.as_character()->on_hit( &here, this, bodypart_str_id::NULL_ID().id(), 0.0f, &dp );
     }
-    cata::lua_ui::dispatch_native_hook(
+    cata::lua_platform::dispatch_native_hook(
     "on_creature_melee_attacked", {
         { "attacker", static_cast<const Character *>( this ) },
         { "target", static_cast<const Creature *>( &t ) },
@@ -1107,10 +1090,7 @@ void Character::reach_attack( const tripoint_bub_ms &p, int forced_movecost )
     // Max out recoil
     recoil = MAX_RECOIL;
 
-    // Weariness handling
-    // 1 / mult because mult is the percent penalty, in the form 1.0 == 100%
-    const float weary_mult = 1.0f / exertion_adjusted_move_multiplier( EXTRA_EXERCISE );
-    int move_cost = attack_speed( weapon ) * weary_mult;
+    int move_cost = attack_speed( weapon );
     float skill = std::min( 10.0f, get_skill_level( skill_melee ) );
     int t = 0;
     map &here = get_map();
@@ -1142,7 +1122,7 @@ void Character::reach_attack( const tripoint_bub_ms &p, int forced_movecost )
             /** @ARM_STR increases bash effects when reach attacking past something */
             here.bash( path_point, get_arm_str() + weapon.damage_melee( damage_bash ) );
             handle_melee_wear( get_wielded_item() );
-            mod_moves( forced_movecost >= 0 ? -forced_movecost : -move_cost );
+            reduce_moves_from_attack( forced_movecost, move_cost );
             return;
         }
     }
@@ -1161,7 +1141,7 @@ void Character::reach_attack( const tripoint_bub_ms &p, int forced_movecost )
                                       enchant_vals::mod::MELEE_STAMINA_CONSUMPTION, get_total_melee_stamina_cost() );
         burn_energy_arms( std::min( -50, total_stamina ) );
 
-        mod_moves( forced_movecost >= 0 ? -forced_movecost : -move_cost );
+        reduce_moves_from_attack( forced_movecost, move_cost );
         return;
     }
 
@@ -1368,10 +1348,11 @@ float Character::bonus_damage( bool random ) const
 
 static void roll_melee_damage_internal( const Character &u, const damage_type_id &dt, bool crit,
                                         damage_instance &di, bool average, const item &weap,
-                                        const attack_vector_id &attack_vector, const sub_bodypart_str_id &contact, float crit_mod )
+                                        const attack_vector_id &attack_vector, const sub_bodypart_str_id &contact, float crit_mod,
+                                        float target_cut_armor )
 {
-    // FIXME: Hardcoded damage type
-    float dmg = dt == damage_bash ? 0.f : u.mabuff_damage_bonus( dt ) + weap.damage_melee( dt );
+    float dmg = u.mabuff_damage_bonus( dt ) + weap.damage_melee( dt );
+    float dmg_mul = 1.0f;
     bool unarmed = !attack_vector->weapon;
     int arpen = 0;
 
@@ -1379,6 +1360,30 @@ static void roll_melee_damage_internal( const Character &u, const damage_type_id
 
     if( u.has_active_bionic( bio_cqb ) ) {
         skill = BIO_CQB_LEVEL;
+    }
+
+    // FIXME: Hardcoded damage type effects (bash)
+    if( dt == damage_bash ) {
+        /** @ARM_STR increases bashing damage */
+        /** @EFFECT_STR increases bashing damage */
+        dmg += u.bonus_damage( !average );
+        /** @EFFECT_BASHING caps bash damage with bashing weapons */
+        float bash_cap = 2 * u.get_arm_str() + 2 * skill;
+
+        /** Martial arts can increase bash cap by melee skill. */
+        if( u.is_melee_bash_damage_cap_bonus() ) {
+            bash_cap += u.get_skill_level( skill_melee );
+        }
+        if( bash_cap < dmg && !weap.is_null() ) {
+            // If damage goes over cap due to low stats/skills,
+            // scale the post-armor damage down halfway between damage and cap
+            dmg_mul *= ( 1.0f + ( bash_cap / dmg ) ) / 2.0f;
+        }
+
+        /** @ARM_STR boosts low cap on bashing damage */
+        const float low_cap = std::min( 1.0f, u.get_arm_str() / 20.0f );
+        const float bash_min = low_cap * dmg;
+        dmg = average ? ( bash_min + dmg ) * 0.5f : rng_float( bash_min, dmg );
     }
 
     if( unarmed && !u.natural_attack_restricted_on( contact ) ) {
@@ -1391,58 +1396,29 @@ static void roll_melee_damage_internal( const Character &u, const damage_type_id
             arpen += contact->parent->unarmed_arpen( dt );
         }
     }
-    /** @ARM_STR increases bashing damage */
-    float stat_bonus = u.bonus_damage( !average );
-    stat_bonus += u.mabuff_damage_bonus( dt );
-    /** @EFFECT_STR increases bashing damage */
-    float weap_dam = weap.damage_melee( dt ) + stat_bonus;
-    /** @EFFECT_BASHING caps bash damage with bashing weapons */
-    float bash_cap = 2 * u.get_arm_str() + 2 * skill;
 
-    // FIXME: Hardcoded damage type effects (bash)
-    if( dt != damage_bash && dmg <= 0 ) {
+    if( dmg <= 0 ) {
         return; // No negative damage!
-    } else if( dt == damage_bash ) {
-        float melee_bonus = u.get_skill_level( skill_melee );
-
-        /** Martial arts can increase bash cap by melee skill. */
-        if( u.is_melee_bash_damage_cap_bonus() ) {
-            bash_cap += melee_bonus;
-        }
     }
 
-    float dmg_mul = 1.0f;
     // FIXME: Hardcoded damage type effects (stab)
-    if( dt == damage_stab ) {
-        // 66%, 76%, 86%, 96%, 106%, 116%, 122%, 128%, 134%, 140%
-        /** @EFFECT_STABBING increases stabbing damage multiplier */
-        if( skill <= 5 ) {
-            dmg_mul = 0.66 + 0.1 * skill;
+    if( !dt->skill.is_null() ) {
+        if( dt == damage_stab ) {
+            // 66%, 76%, 86%, 96%, 106%, 116%, 122%, 128%, 134%, 140%
+            /** @EFFECT_STABBING increases stabbing damage multiplier */
+            if( skill <= 5 ) {
+                dmg_mul = 0.66 + 0.1 * skill;
+            } else {
+                dmg_mul = 0.86 + 0.06 * skill;
+            }
         } else {
-            dmg_mul = 0.86 + 0.06 * skill;
+            // 80%, 88%, 96%, 104%, 112%, 116%, 120%, 124%, 128%, 132%
+            if( skill < 5 ) {
+                dmg_mul *= 0.8 + 0.08 * skill;
+            } else {
+                dmg_mul *= 0.96 + 0.04 * skill;
+            }
         }
-    } else {
-        // 80%, 88%, 96%, 104%, 112%, 116%, 120%, 124%, 128%, 132%
-        if( skill < 5 ) {
-            dmg_mul *= 0.8 + 0.08 * skill;
-        } else {
-            dmg_mul *= 0.96 + 0.04 * skill;
-        }
-    }
-
-    // FIXME: Hardcoded damage type effects (bash)
-    if( dt == damage_bash ) {
-        if( bash_cap < weap_dam && !weap.is_null() ) {
-            // If damage goes over cap due to low stats/skills,
-            // scale the post-armor damage down halfway between damage and cap
-            dmg_mul *= ( 1.0f + ( bash_cap / weap_dam ) ) / 2.0f;
-        }
-
-        /** @ARM_STR boosts low cap on bashing damage */
-        const float low_cap = std::min( 1.0f, u.get_arm_str() / 20.0f );
-        const float bash_min = low_cap * weap_dam;
-        weap_dam = average ? ( bash_min + weap_dam ) * 0.5f : rng_float( bash_min, weap_dam );
-        dmg += weap_dam;
     }
 
     dmg_mul *= u.mabuff_damage_mult( dt );
@@ -1450,22 +1426,24 @@ static void roll_melee_damage_internal( const Character &u, const damage_type_id
 
     float armor_mult = 1.0f;
     if( crit ) {
-        // FIXME: Hardcoded damage type effects (stab, cut, bash)
-        if( dt == damage_stab ) {
-            // Critical damage bonus for stabbing scales with skill
-            dmg_mul *= 1.0 + ( skill / 10.0 ) * crit_mod;
-            // Stab criticals have extra %arpen
-            armor_mult = 1.f - 0.34f * crit_mod;
-        } else if( dt == damage_cut ) {
-            dmg_mul *= 1.f + 0.25f * crit_mod;
-            arpen += static_cast<int>( 5.f * crit_mod );
-            // 25% armor penetration
-            armor_mult = 1.f - 0.25f * crit_mod;
-        } else if( dt == damage_bash ) {
-            dmg_mul *= 1.f + 0.5f * crit_mod;
-            // 50% armor penetration
-            armor_mult = 1.f - 0.5f * crit_mod;
+        float crit_dmg = dt->melee_crit_dmg_mult;
+        if( !dt->skill.is_null() ) {
+            crit_dmg += dt->melee_crit_dmg_mult_per_skill * skill;
         }
+        // Cut criticals against poorly-armored targets gain a stat-scaled bonus zone:
+        // triggers when raw damage reaches 250% of the target's cut armor (0 armor
+        // always qualifies); ramp is logistic from sum 16 to sum 56, capped at +50%.
+        if( dt == damage_cut && dmg >= 2.5f * target_cut_armor &&
+            u.get_str() > 8 && u.get_dex() > 8 ) {
+            const int str_val = std::min( u.get_str(), 40 );
+            const int dex_val = std::min( u.get_dex(), 40 );
+            const float zone = 0.5f *
+                               ( 1.0f - logarithmic_range( 16, 56, str_val + dex_val ) );
+            dmg *= 1.0f + zone;
+        }
+        dmg_mul *= 1.0f + crit_dmg * crit_mod;
+        armor_mult = 1.0f - ( 1.0f - dt->melee_crit_armor_mult ) * crit_mod;
+        arpen += static_cast<int>( dt->melee_crit_armor_penetration * crit_mod );
     }
 
     di.add_damage( dt, dmg, arpen, armor_mult, dmg_mul );
@@ -1473,11 +1451,12 @@ static void roll_melee_damage_internal( const Character &u, const damage_type_id
 
 void Character::roll_damage( const damage_type_id &dt, bool crit, damage_instance &di, bool average,
                              const item &weap, const attack_vector_id &attack_vector, const sub_bodypart_str_id &contact,
-                             float crit_mod ) const
+                             float crit_mod, float target_cut_armor ) const
 {
-    // For handling typical melee damage types (bash, cut, stab)
-    if( dt->melee_only ) {
-        roll_melee_damage_internal( *this, dt, crit, di, average, weap, attack_vector, contact, crit_mod );
+    // For handling melee damage types, and physical damage types during melee attacks
+    if( dt->melee_only || dt->physical ) {
+        roll_melee_damage_internal( *this, dt, crit, di, average, weap, attack_vector, contact, crit_mod,
+                                    target_cut_armor );
         return;
     }
 
@@ -1855,11 +1834,14 @@ void Character::perform_technique( const ma_technique &technique, Creature &t,
     move_cost += technique.move_cost_penalty( *this ) * rep;
 
     // Add effects for each repeat of the tech
+    const_dialogue d( get_const_talker_for( *this ), get_const_talker_for( t ) );
     for( int i = 0; i < rep; i++ ) {
         for( const tech_effect_data &eff : technique.tech_effects ) {
             // Add the tech's effects if it rolls the chance and either did damage or ignores it
             if( x_in_y( eff.chance, 100 ) && ( di.total_damage() != 0 || !eff.on_damage ) ) {
-                if( eff.req_flag == json_flag_NULL || has_flag( eff.req_flag ) ) {
+                const bool flag_matches = eff.req_flag == json_flag_NULL || has_flag( eff.req_flag );
+                const bool condition_matches = !eff.has_condition || eff.condition( d );
+                if( flag_matches && condition_matches ) {
                     t.add_effect( eff.id, time_duration::from_turns( eff.duration ), eff.permanent );
                     add_msg_if_player( m_good, _( eff.message ), t.disp_name() );
                 }
@@ -1885,6 +1867,10 @@ void Character::perform_technique( const ma_technique &technique, Creature &t,
             eoc->activate_activation_only( d, "a technique activation", "technique being activated",
                                            "technique" );
         }
+        cata::lua_platform::invoke_technique_application_handler(
+            technique.id.str(), technique.lua_platform_mod,
+            technique.lua_platform_apply_handler, *this, t, i + 1, rep,
+            di.total_damage(), cur_weapon ? cur_weapon.get_item()->typeId().str() : std::string() );
     }
 
     if( technique.needs_ammo ) {
@@ -2041,12 +2027,12 @@ void Character::perform_technique( const ma_technique &technique, Creature &t,
         moves = temp_moves;
         set_stamina( temp_stamina );
     }
-    cata::lua_ui::dispatch_native_hook(
+    cata::lua_platform::dispatch_native_hook(
     "on_creature_performed_technique", {
         { "creature", static_cast<const Character *>( this ) },
         { "target", static_cast<const Creature *>( &t ) },
         {
-            "technique", cata::lua_ui::native_callback_id {
+            "technique", cata::lua_platform::native_callback_id {
                 "martial_art_technique", technique.id.str()
             }
         },
@@ -2200,7 +2186,7 @@ bool Character::block_hit( Creature *source, bodypart_id &bp_hit, damage_instanc
     if( !( unarmed || force_unarmed || worn_shield || armed_body_block ) && allow_weapon_blocking ) {
         thing_blocked_with = shield->tname();
         // TODO: Change this depending on damage blocked
-        float wear_modifier = 1.0f;
+        float wear_modifier = 0.5f;
         if( source != nullptr && source->is_hallucination() ) {
             wear_modifier = 0.0f;
         }
@@ -2324,16 +2310,7 @@ bool Character::block_hit( Creature *source, bodypart_id &bp_hit, damage_instanc
 
     // fire martial arts block-triggered effects
     martial_arts_data->ma_onblock_effects( *this );
-    if( shield ) {
-        cata::lua_ui::dispatch_native_callback(
-        "imelee", shield->typeId().str(), "on_block", {
-            { "character", static_cast<const Character *>( this ) },
-            { "source", static_cast<const Creature *>( source ) },
-            { "item", static_cast<const item *>( shield.get_item() ) },
-            { "damage_blocked", static_cast<double>( damage_blocked ) }
-        } );
-    }
-    cata::lua_ui::dispatch_native_hook(
+    cata::lua_platform::dispatch_native_hook(
     "on_creature_blocked", {
         { "creature", static_cast<const Character *>( this ) },
         { "source", static_cast<const Creature *>( source ) },

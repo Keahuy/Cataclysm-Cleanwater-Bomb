@@ -261,3 +261,4 @@ VERSION.txt
 build-tracy/
 *.debug
 /objwin-lua
+tests/objwin/tiles/pch/tests-pch.hpp.gch

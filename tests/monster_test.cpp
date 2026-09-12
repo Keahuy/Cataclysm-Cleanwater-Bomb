@@ -1,5 +1,7 @@
+#include <monster_uid.h>
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -7,9 +9,9 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <string>
-#include <set>
 #include <utility>
 #include <vector>
 
@@ -20,8 +22,8 @@
 #include "character.h"
 #include "coordinates.h"
 #include "creature.h"
-#include "debug.h"
 #include "creature_tracker.h"
+#include "debug.h"
 #include "game.h"
 #include "horde_entity.h"
 #include "item.h"
@@ -40,6 +42,7 @@
 #include "options_helpers.h"
 #include "overmap_map_data_cache.h"
 #include "overmapbuffer.h"
+#include "player_helpers.h"
 #include "point.h"
 #include "rng.h"
 #include "sounds.h"
@@ -52,9 +55,16 @@ using move_statistics = statistics<int>;
 
 static const furn_str_id furn_f_null( "f_null" );
 
+static const efftype_id effect_leashed( "leashed" );
+static const efftype_id effect_led_by_leash( "led_by_leash" );
+static const efftype_id effect_monster_saddled( "monster_saddled" );
+static const efftype_id effect_tied( "tied" );
+
 static const mtype_id mon_dog_zombie_brute( "mon_dog_zombie_brute" );
 static const mtype_id mon_test_zombie( "mon_test_zombie" );
 static const mtype_id pseudo_dormant_mon_zombie_fat( "pseudo_dormant_mon_zombie_fat" );
+
+static const itype_id itype_rope_30( "rope_30" );
 
 static const oter_str_id oter_field( "field" );
 
@@ -62,6 +72,50 @@ static const ter_str_id ter_t_fence( "t_fence" );
 static const ter_str_id ter_t_grass( "t_grass" );
 static const ter_str_id ter_t_palisade( "t_palisade" );
 static const ter_str_id ter_t_water_dp( "t_water_dp" );
+
+TEST_CASE( "monster_uid_copy_and_move", "[monster]" )
+{
+    monster original( mon_test_zombie );
+    original.ensure_uid();
+    REQUIRE( original.uid().is_valid() );
+    const auto original_uid = original.uid().get_value();
+
+    monster copy( original );
+    REQUIRE( copy.uid().is_valid() );
+    CHECK( copy.uid().get_value() != original_uid );
+
+    const auto copy_uid = copy.uid().get_value();
+    monster moved( std::move( copy ) );
+    CHECK( moved.uid().is_valid() );
+    CHECK( moved.uid().get_value() == copy_uid );
+    CHECK( !copy.uid().is_valid() );
+}
+
+TEST_CASE( "creature_tracker_find_monster_by_uid", "[monster][creature_tracker]" )
+{
+    creature_tracker tracker;
+    const auto live_monster = make_shared_fast<monster>( mon_test_zombie,
+                              tripoint_bub_ms( 0, 0, 0 ) );
+    REQUIRE( tracker.add( live_monster ) );
+    REQUIRE( live_monster->uid().is_valid() );
+    const auto live_uid = live_monster->uid().get_value();
+
+    CHECK( tracker.find_by_uid( live_uid ) == live_monster );
+    CHECK( tracker.find_by_uid( 0 ) == nullptr );
+    CHECK( tracker.find_by_uid( -1 ) == nullptr );
+
+    tracker.remove( *live_monster );
+    CHECK( tracker.find_by_uid( live_uid ) == nullptr );
+
+    const auto dead_monster = make_shared_fast<monster>( mon_test_zombie,
+                              tripoint_bub_ms( 1, 0, 0 ) );
+    REQUIRE( tracker.add( dead_monster ) );
+    REQUIRE( dead_monster->uid().is_valid() );
+    const auto dead_uid = dead_monster->uid().get_value();
+    dead_monster->set_hp( 0 );
+    REQUIRE( dead_monster->is_dead() );
+    CHECK( tracker.find_by_uid( dead_uid ) == nullptr );
+}
 
 
 static int moves_to_destination( const std::string &monster_type,
@@ -350,7 +404,7 @@ static void monster_check()
 TEST_CASE( "check_mon_id" )
 {
     for( const mtype &mon : MonsterGenerator::generator().get_all_mtypes() ) {
-        if( !mon.src.empty() && mon.src.back().second.str() != "dda" ) {
+        if( !mon.src.empty() && mon.src.back().second.str() != "ccb" ) {
             continue;
         }
         std::string mon_id = mon.id.str();
@@ -614,6 +668,33 @@ TEST_CASE( "monster_extend_flags", "[monster]" )
     const mtype &m = *mon_dog_zombie_brute;
     CHECK( m.has_flag( mon_flag_SEES ) );
     CHECK( m.has_flag( mon_flag_PUSH_VEH ) );
+}
+
+TEST_CASE( "mounting_a_tied_mount_clears_its_leash_state", "[monster][mount]" )
+{
+    clear_avatar();
+    clear_map_without_vision();
+    clear_creatures();
+
+    avatar &player = get_avatar();
+    const tripoint_bub_ms horse_pos = player.pos_bub() + tripoint::east;
+    monster &horse = spawn_test_monster( "mon_horse_police", horse_pos );
+    horse.friendly = -1;
+    horse.add_effect( effect_tied, 1_turns, true );
+    horse.add_effect( effect_led_by_leash, 1_turns, true );
+
+    REQUIRE( horse.tied_item );
+    REQUIRE( horse.has_effect( effect_leashed ) );
+    REQUIRE( horse.has_effect( effect_monster_saddled ) );
+
+    player.mount_creature( horse );
+    player.forced_dismount();
+
+    CHECK( player.has_amount( itype_rope_30, 1 ) );
+    CHECK_FALSE( horse.tied_item );
+    CHECK_FALSE( horse.has_effect( effect_leashed ) );
+    CHECK_FALSE( horse.has_effect( effect_led_by_leash ) );
+    CHECK( horse.has_effect( effect_monster_saddled ) );
 }
 
 TEST_CASE( "monster_broken_verify", "[monster]" )

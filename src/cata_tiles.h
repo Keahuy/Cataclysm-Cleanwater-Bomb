@@ -600,6 +600,7 @@ using color_block_overlay_container = std::pair<SDL_BlendMode, std::multimap<poi
 class cata_tiles
 {
         friend class cata_tiles_test_helper;
+        friend struct renderer_recovery_test_support;
 
     public:
         cata_tiles( const SDL_Renderer_Ptr &render, const GeometryRenderer_Ptr &geometry,
@@ -803,11 +804,18 @@ class cata_tiles
          * structural part under @p cursor_vp_mount. Used by veh_interact as a graphical
          * alternative to the ASCII display_veh(). @p cpart is set to the structural part
          * index under the cursor (matching the ASCII path's contract).
+         * When @p selection is present, highlight its inclusive mount rectangle.
          * Returns false without drawing for isometric tilesets, so the caller can fall
          * back to the ASCII display.
          */
         bool draw_vehicle_preview( const catacurses::window &w_disp, const vehicle &veh,
-                                   const point_rel_ms &cursor_vp_mount, int &cpart );
+                                   const point_rel_ms &cursor_vp_mount, int &cpart,
+                                   const std::optional<std::pair<point_rel_ms, point_rel_ms>> &selection = std::nullopt );
+
+        /** Convert an inclusive mount rectangle to pixels in the fixed vehicle preview layout. */
+        static SDL_Rect vehicle_preview_selection_rect( const point_rel_ms &first,
+                const point_rel_ms &second, const point_rel_ms &cursor_vp_mount,
+                const point &center_px, const point &tile_size );
 
         /**
          * Render @p ch (base sprite plus mutation/worn/wielded overlays) into an
@@ -1487,6 +1495,7 @@ class cata_tiles
         // Drop the pixel minimap's renderer-owned resources and cache so
         // they rebuild against the live renderer on the next draw.
         void reset_minimap();
+        void reset_character_preview();
 
         // Drop the scratch silhouette mask target so the next tinted ortho
         // draw reallocates it against the live renderer.

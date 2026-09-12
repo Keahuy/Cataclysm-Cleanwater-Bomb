@@ -1,5 +1,12 @@
 #include "monster.h"
 
+#include <calendar.h>
+#include <character_id.h>
+#include <color.h>
+#include <compatibility.h>
+#include <creature.h>
+#include <monster_uid.h>
+#include <value_ptr.h>
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -18,7 +25,6 @@
 #include "cached_options.h"
 #include "cata_imgui.h"
 #include "catacharset.h"
-#include "catalua_ui.h"
 #include "character.h"
 #include "coordinates.h"
 #include "creature_tracker.h"
@@ -49,6 +55,8 @@
 #include "item_pocket.h"
 #include "itype.h"
 #include "iuse.h"
+#include "lua_platform_hooks.h"
+#include "lua_platform_runtime.h"
 #include "magic.h"
 #include "magic_enchantment.h"
 #include "map.h"
@@ -269,7 +277,7 @@ static time_duration reproduction_interval( const mtype &type )
     return std::max( 1_turns, base_interval / speed );
 }
 
-monster::monster()
+monster::monster() : uid_( generate_next_monster_uid() )
 {
     unset_dest();
     moves = 0;
@@ -354,6 +362,20 @@ monster::monster( monster && ) noexcept( map_is_noexcept ) = default;
 monster::~monster() = default;
 monster &monster::operator=( const monster & ) = default;
 monster &monster::operator=( monster && ) noexcept( string_is_noexcept ) = default;
+
+monster monster::copy_for_persistence() const
+{
+    monster result( *this );
+    result.uid_.deserialize( uid_.get_value() );
+    return result;
+}
+
+void monster::ensure_uid()
+{
+    if( !uid_.is_valid() ) {
+        uid_.deserialize( generate_next_monster_uid() );
+    }
+}
 
 void monster::on_move( const tripoint_abs_ms &old_pos )
 {
@@ -2078,6 +2100,14 @@ bool monster::is_elec_immune() const
 
 bool monster::is_immune_effect( const efftype_id &effect ) const
 {
+    // Data-defined immunity must be honored before legacy effect-specific
+    // branches return their material/species result.
+    for( const flag_id &flag : effect->immune_flags ) {
+        if( has_flag( flag ) ) {
+            return true;
+        }
+    }
+
     if( effect == effect_onfire ) {
         return is_immune_damage( damage_heat ) ||
                made_of( phase_id::LIQUID ) ||
@@ -2120,11 +2150,6 @@ bool monster::is_immune_effect( const efftype_id &effect ) const
         } else {
             return type->bodytype == "snake" || type->bodytype == "blob" || type->bodytype == "fish" ||
                    has_flag( mon_flag_FLIES ) || has_flag( mon_flag_IMMOBILE ) || has_flag( json_flag_CANNOT_MOVE );
-        }
-    }
-    for( const flag_id &flag : effect->immune_flags ) {
-        if( has_flag( flag ) ) {
-            return true;
         }
     }
     return false;
@@ -2181,9 +2206,43 @@ bool monster::is_dead_state() const
     return hp <= 0;
 }
 
-bool monster::block_hit( Creature *, bodypart_id &, damage_instance & )
+bool monster::block_hit( Creature *, bodypart_id &, damage_instance &dam )
 {
-    return false;
+    if( blocks_left <= 0 ) {
+        return false;
+    }
+
+    --blocks_left;
+
+    if( !x_in_y( type->block.chance, 100 ) ) {
+        return false;
+    }
+
+    bool blocked = false;
+    float remaining_block = type->block.effectiveness;
+
+    for( damage_unit &elem : dam.damage_units ) {
+        if( remaining_block <= 0.0f ) {
+            break;
+        }
+
+        if( type->block.ranged || ( elem.type->physical && elem.type->melee_only ) ) {
+            const float block_amount = std::min( remaining_block, elem.amount );
+
+            elem.amount -= block_amount;
+            remaining_block -= block_amount;
+
+            if( block_amount > 0.0f ) {
+                blocked = true;
+            }
+        }
+    }
+
+    if( blocked ) {
+        add_msg( m_info, _( "%s blocks the attack!" ), disp_name() );
+    }
+
+    return blocked;
 }
 
 const weakpoint *monster::absorb_hit( const weakpoint_attack &attack, const bodypart_id &,
@@ -2228,7 +2287,9 @@ bool monster::melee_attack( Creature &target, float accuracy )
         return false;
     }
     if( !sees( here, target ) && !target.is_hallucination() ) {
-        debugmsg( "Z-Level view violation: %s tried to attack %s.", disp_name(), target.disp_name() );
+        // Adjacency does not guarantee visibility: stairs can connect tiles
+        // without line of sight, and a target can be invisible. A rejected
+        // attack is an ordinary AI outcome, with its move cost paid above.
         return false;
     }
     // Prevent monsters from attacking THROUGH terrain if they are submerged under it & target isn't.
@@ -2475,7 +2536,18 @@ void monster::deal_damage_handle_type( const effect_source &source, const damage
         }
     }
     if( du.type == damage_bullet || du.type->edged ) {
-        make_bleed( source, 1_minutes * rng( 0, adjusted_damage ) );
+        time_duration bleed_dur = 1_minutes * rng( 0, adjusted_damage );
+        if( du.type == damage_cut ) {
+            const Creature *src_creature = source.resolve_creature();
+            if( src_creature != nullptr && src_creature->as_character() != nullptr ) {
+                const Character &chr_src = *src_creature->as_character();
+                // Skill with cutting weapons deepens cut wounds, capped at +25%.
+                const double bonus = 0.025 * chr_src.get_skill_level( damage_cut->skill );
+                const int bonus_pct = static_cast<int>( std::min( bonus, 0.25 ) * 100 );
+                bleed_dur = bleed_dur * ( 100 + bonus_pct ) / 100;
+            }
+        }
+        make_bleed( source, bleed_dur );
     }
 
     Creature::deal_damage_handle_type( source, du,  bp, damage, pain );
@@ -2986,6 +3058,8 @@ void monster::explode()
 
 void monster::process_turn()
 {
+    blocks_left = type->block.count;
+
     map &here = get_map();
     if( !is_hallucination() ) {
         for( const std::pair<const emit_id, time_duration> &e : type->emit_fields ) {
@@ -3214,6 +3288,10 @@ void monster::die( map *here, Creature *nkiller )
         }
     }
 
+    cata::lua_platform::invoke_monster_death_handler(
+        type->id.str(), type->mdeath_effect.lua_platform_mod,
+        type->mdeath_effect.lua_platform_handler, *this, killer, pos_abs() );
+
     // scale overkill damage by enchantments
     if( nkiller && ( nkiller->is_npc() || nkiller->is_avatar() ) ) {
         int current_hp = get_hp();
@@ -3333,7 +3411,7 @@ void monster::die( map *here, Creature *nkiller )
         }
     }
 
-    cata::lua_ui::dispatch_native_hook(
+    cata::lua_platform::dispatch_native_hook(
     "on_mon_death", {
         { "monster", static_cast<const Creature *>( this ) },
         {
@@ -3494,7 +3572,7 @@ void monster::spawn_dissectables_on_death( item *corpse ) const
                 dissectable.set_flag( flg );
             }
             for( const fault_id &flt : entry.faults ) {
-                dissectable.set_fault( flt );
+                dissectable.set_fault( flt, false, nullptr, true );
             }
             if( corpse ) {
                 corpse->put_in( dissectable, pocket_type::CORPSE );
@@ -3604,15 +3682,15 @@ void monster::process_one_effect( effect &it, bool is_new )
     const std::string body_part =
         it.get_bp() == bodypart_str_id::NULL_ID() ?
         std::string() : it.get_bp().id().str();
-    const cata::lua_ui::native_callback_arguments payload = {
+    const cata::lua_platform::native_callback_arguments payload = {
         { "monster", static_cast<const Creature *>( this ) },
         {
-            "effect", cata::lua_ui::native_callback_id {
+            "effect", cata::lua_platform::native_callback_id {
                 "effect", it.get_id().str()
             }
         },
         {
-            "body_part", cata::lua_ui::native_callback_id {
+            "body_part", cata::lua_platform::native_callback_id {
                 "body_part", body_part
             }
         },
@@ -3620,16 +3698,16 @@ void monster::process_one_effect( effect &it, bool is_new )
     };
     const bool dispatch_added =
         it.has_flag( flag_EFFECT_LUA_ON_ADDED ) &&
-        cata::lua_ui::has_native_hook( "on_mon_effect_added" );
+        cata::lua_platform::has_native_hook( "on_mon_effect_added" );
     const bool dispatch_tick =
         it.has_flag( flag_EFFECT_LUA_ON_TICK ) &&
-        cata::lua_ui::has_native_hook( "on_mon_effect" );
+        cata::lua_platform::has_native_hook( "on_mon_effect" );
     if( dispatch_added ) {
-        cata::lua_ui::dispatch_native_hook(
+        cata::lua_platform::dispatch_native_hook(
             "on_mon_effect_added", payload );
     }
     if( dispatch_tick ) {
-        cata::lua_ui::dispatch_native_hook(
+        cata::lua_platform::dispatch_native_hook(
             "on_mon_effect", payload );
     }
 }
@@ -3644,7 +3722,7 @@ void monster::process_effects()
         int intensity;
     };
     const bool has_lua_effect_hook =
-        cata::lua_ui::has_native_hook( "on_mon_effect" );
+        cata::lua_platform::has_native_hook( "on_mon_effect" );
     std::vector<lua_effect_tick> lua_effect_ticks;
     // Monster only effects
     for( auto &elem : *effects ) {
@@ -3665,19 +3743,19 @@ void monster::process_effects()
         }
     }
     for( const lua_effect_tick &tick : lua_effect_ticks ) {
-        cata::lua_ui::dispatch_native_hook(
+        cata::lua_platform::dispatch_native_hook(
         "on_mon_effect", {
             {
                 "monster",
                 static_cast<const Creature *>( this )
             },
             {
-                "effect", cata::lua_ui::native_callback_id {
+                "effect", cata::lua_platform::native_callback_id {
                     "effect", tick.effect
                 }
             },
             {
-                "body_part", cata::lua_ui::native_callback_id {
+                "body_part", cata::lua_platform::native_callback_id {
                     "body_part", tick.body_part
                 }
             },
@@ -3867,18 +3945,11 @@ void monster::make_pet()
 void monster::make_pet( Character &actor )
 {
     make_pet();
-    const cata::lua_ui::native_callback_arguments payload = {
+    const cata::lua_platform::native_callback_arguments payload = {
         { "character", static_cast<const Character *>( &actor ) },
-        { "monster", static_cast<const Creature *>( this ) },
-        {
-            "monster_type", cata::lua_ui::native_callback_id {
-                "monster", type->id.str()
-            }
-        }
+        { "monster", static_cast<const Creature *>( this ) }
     };
-    cata::lua_ui::dispatch_native_callback(
-        "monster", type->id.str(), "on_tame", payload );
-    cata::lua_ui::dispatch_native_hook(
+    cata::lua_platform::dispatch_native_hook(
         "on_monster_tame", payload );
 }
 
@@ -4311,18 +4382,18 @@ void monster::on_unload()
 void monster::on_load()
 {
     const auto dispatch_lua_loaded_hooks = [this]() {
-        const cata::lua_ui::native_callback_arguments payload = {
+        const cata::lua_platform::native_callback_arguments payload = {
             { "creature", static_cast<const Creature *>( this ) },
             { "monster", static_cast<const Creature *>( this ) }
         };
-        if( cata::lua_ui::has_native_hook(
+        if( cata::lua_platform::has_native_hook(
                 "on_creature_loaded" ) ) {
-            cata::lua_ui::dispatch_native_hook(
+            cata::lua_platform::dispatch_native_hook(
                 "on_creature_loaded", payload );
         }
-        if( cata::lua_ui::has_native_hook(
+        if( cata::lua_platform::has_native_hook(
                 "on_monster_loaded" ) ) {
-            cata::lua_ui::dispatch_native_hook(
+            cata::lua_platform::dispatch_native_hook(
                 "on_monster_loaded", payload );
         }
     };

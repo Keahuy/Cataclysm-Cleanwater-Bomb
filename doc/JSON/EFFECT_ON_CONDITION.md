@@ -614,6 +614,22 @@ Check if `map_cache` contain value `has`, `lack` or `read`
 
 #### Examples
 
+### `mod_is_loaded`
+- type: string
+- Return true if mod_id is loaded
+
+#### Valid talkers:
+
+| Avatar | NPC | Monster | Furniture | Item | Vehicle |
+| ------ | --------- | ---- | ------- | --- | ---- |
+| ✔️ | ❌ | ❌ | ❌ | ❌ | ❌ |
+
+#### Examples
+True if the world has Sky Island loaded
+```jsonc
+{ "mod_is_loaded": "sky_island" }
+```
+
 Check if two variables are `yes`
 ```jsonc
 "compare_string": [ "yes", { "context_val": "some_context_should_be_yes" }, { "context_val": "some_another_context_also_should_be_yes" } ]
@@ -2607,8 +2623,8 @@ NPC run EoCs, provided by this effect; can work outside of reality bubble
 | Syntax | Optionality | Value  | Info |
 | --- | --- | --- | --- |
 | "u_run_npc_eocs"/ "npc_run_npc_eocs" | **mandatory** | array of eocs | EoCs that would be run by NPCs |
-| "unique_ids" | optional | string, [variable objects](#variable-object) or array | id of NPCs that would be affected; lack of ids make effect run EoC on every NPC in your reality bubble, if `"local": true`, and to every NPC in the world, if `"local": false`; unique ID of every npc is specified in mapgen, using `npcs` or `place_npcs` |
-| "local" | optional | boolean | default false; if true, the effect is run for every NPC in the world; if false, effect is run only to NPC in your reality bubble |
+| "unique_ids" | optional | string, [variable objects](#variable-object) or array | id of NPCs that would be affected; lack of ids make effect run EoC on every NPC in your reality bubble if `"local": true`, and to every NPC in the world if `"local": false`; unique ID of every npc is specified in mapgen, using `npcs` or `place_npcs` |
+| "local" | optional | boolean | default false; if true, the effect is run for every NPC in your reality bubble; if false, effect is run for every NPC in the world |
 | "npc_range" | optional | int or [variable object](#variable-object) | if used and neither 'z_min' nor 'z_max' is specified, only NPC having the same z position as the player in this range are affected |
 | "z_min" | optional | int or [variable object](#variable-object) | if used, only NPC'z position >= z_min are affected |
 | "z_max" | optional | int or [variable object](#variable-object) | if used, only NPC'z position <= z_max are affected |
@@ -5948,29 +5964,4 @@ Combination of values work as `and`, no matter how they are arranged. This two n
 ```
 ```jsonc
 "search_data": [ { "category": "weapons", "wielded_only": true } ]
-```
-
-### `run_lua`
-
-`run_lua` calls a Lua handler registered by an active Lua source with
-`game.handlers.register`.  The handler name must begin with that source's id
-and a period.  `game.handlers.register` requires the API v5 `game.write`
-capability in the Lua source's `manifest.json`; mod scripts do not receive it
-by default.  `args` is copied to `context.args` and accepts only boolean,
-number, and string values.  The handler receives `context.kind` equal to
-`"eoc"`, plus `context.alpha` and `context.beta` when those talkers exist.
-
-| Member | Optionality | Value | Info |
-| --- | --- | --- | --- |
-| `handler` | **mandatory** | string | Registered Lua handler name |
-| `args` | optional | object | Scalar static arguments |
-
-```jsonc
-{ "effect": { "run_lua": { "handler": "mymod.example", "args": { "count": 2 } } } }
-```
-
-```lua
-game.handlers.register("mymod.example", function(context)
-    local count = context.args.count
-end)
 ```
